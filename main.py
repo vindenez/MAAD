@@ -35,7 +35,7 @@ class AdapAD:
         # init learning components
         self.data_predictor = NormalDataPredictor(
             config.LSTM_size_layer, 
-            config.LSTM_size, 
+            config.LSTM_size,
             self.predictor_config['lookback_len'],
             self.predictor_config['prediction_len'],
             self.num_features,
@@ -62,7 +62,7 @@ class AdapAD:
         
         # for logging purpose
         self.feature_columns = feature_columns
-        self.f_name = 'results/data3716' + config.data_source + '/' + 'att_lstm_' + str(minimal_threshold) + '.csv'
+        self.f_name = 'results/conductivity/' + config.data_source + '_' + str(minimal_threshold) + '.csv'
         print(self.f_name)
         os.makedirs(os.path.dirname(self.f_name), exist_ok=True)
         self.f_log = open(self.f_name, 'w')
@@ -330,6 +330,9 @@ class AdapAD:
             else:
                 print("Default normal, not marking as anomalous")
         
+        # Add debug print to help diagnose the issue
+        print(f"Final anomaly decision: {is_anomalous_ret}, Range violation: {range_violation}, Error: {prediction_error}, Threshold: {threshold}")
+        
         # Update models
         self.data_predictor.update(
             config.epoch_update, 
@@ -363,8 +366,26 @@ if __name__ == "__main__":
     
     data_source = pd.read_csv(config.data_source_path)
     
+    # Clean column names by stripping whitespace
+    data_source.columns = [col.strip() for col in data_source.columns]
+    
+    # Print available columns to help debug
+    print("Available columns in dataset (after cleaning):", data_source.columns.tolist())
+    
     # Select feature columns based on config
     feature_columns = config.feature_columns
+    print(f"Configured features: {feature_columns}")
+    
+    # Check if all configured feature columns exist in the dataset
+    missing_columns = [col for col in feature_columns if col not in data_source.columns]
+    if missing_columns:
+        print(f"Warning: The following configured columns are missing from the dataset: {missing_columns}")
+        print("Using only available columns...")
+        feature_columns = [col for col in feature_columns if col in data_source.columns]
+        
+    if not feature_columns:
+        raise Exception("No valid feature columns found in the dataset. Please check your configuration.")
+    
     print(f"Using features: {feature_columns}")
     
     # AdapAD

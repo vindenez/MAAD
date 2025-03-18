@@ -3691,4 +3691,3 @@ timestamp,conductivity_conductivity_observed,conductivity_conductivity_predicted
 3701,27.558200,27.604834,27.534834,27.674834,False,0.000022,0.007000,conductivity_conductivity:0.2252|conductivity_temperature:0.2447|conductivity_salinity:0.1096|conductivity_density:0.1821|conductivity_soundspeed:0.2384
 3702,28.095400,27.860875,27.790875,27.930875,False,0.000550,0.007000,conductivity_conductivity:0.2264|conductivity_temperature:0.2460|conductivity_salinity:0.1072|conductivity_density:0.1809|conductivity_soundspeed:0.2395
 3703,26.182900,26.909989,26.839989,26.979989,False,0.005287,0.007000,conductivity_conductivity:0.2222|conductivity_temperature:0.2387|conductivity_salinity:0.1208|conductivity_density:0.1852|conductivity_soundspeed:0.2332
-3704,0.712954,15.672479,15.602479,15.742479,True,2.237874,0.007000,conductivity_conductivity:0.1472|conductivity_temperature:0.1572|conductivity_salinity:0.4174|conductivity_density:0.1245|conductivity_soundspeed:0.1538
