@@ -6,10 +6,6 @@ import torch.nn.functional as F
 from utils import *
 
 class FeatureAttention(nn.Module):
-    """
-    Attention mechanism that calculates similarity between target and non-target features
-    as described in the paper "Multivariate Time Series Data Prediction Based on ATT-LSTM Network"
-    """
     def __init__(self, num_features):
         super(FeatureAttention, self).__init__()
         self.num_features = num_features
@@ -98,7 +94,6 @@ class ATTLSTMPredictor(nn.Module):
         return out
     
     def get_attention_weights(self):
-        """Return the last computed attention weights"""
         if hasattr(self, 'attention_weights'):
             return self.attention_weights
         return None
@@ -183,7 +178,6 @@ class NormalDataPredictor():
             loss_l.append(loss.item())
             
     def get_attention_weights(self):
-        """Return the attention weights from the model"""
         return self.predictor.get_attention_weights()
 
 class AnomalousThresholdGenerator():
@@ -203,8 +197,12 @@ class AnomalousThresholdGenerator():
         )
         
         self.fc = nn.Linear(hidden_size, 1)
+        self.training = True
         
     def train(self, epoch, lr, data2learn):
+        # Set to training mode
+        self.training = True
+        
         num_epochs = epoch
         learning_rate = lr
 
@@ -236,6 +234,28 @@ class AnomalousThresholdGenerator():
                 loss = criterion(output, torch.Tensor(_y[0:1]).reshape((1,-1)))
                 loss.backward()
                 optimizer.step()
+    
+    def eval(self):
+        """Set the model to evaluation mode"""
+        self.training = False
+        self.generator.eval()
+        self.fc.eval()
+        
+    def __call__(self, prediction_errors):
+        """Allow the model to be called directly like a PyTorch model"""
+        with torch.no_grad():
+            # Make sure prediction_errors is a tensor
+            if not isinstance(prediction_errors, torch.Tensor):
+                prediction_errors = torch.Tensor(prediction_errors)
+            
+            # Reshape for LSTM
+            _x = prediction_errors.reshape(1, self.lookback_len, 1)
+            
+            # Forward pass
+            lstm_out, (h_n, _) = self.generator(_x)
+            threshold = self.fc(h_n[-1])
+            
+            return threshold
                 
     def update(self, epoch_update, lr_update, past_errors, recent_error):
         num_epochs = epoch_update

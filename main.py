@@ -128,23 +128,27 @@ class AdapAD:
             # For 2D array (multiple features)
             normalized_data = np.zeros_like(data, dtype=float)
             for i in range(data.shape[1]):
+                # Convert data to float, handling any non-numeric values
+                feature_data = np.array(data[:, i], dtype=float)
                 min_val = self.sensor_range.lower(i)
                 max_val = self.sensor_range.upper(i)
-                normalized_data[:, i] = (data[:, i] - min_val) / (max_val - min_val)
+                normalized_data[:, i] = (feature_data - min_val) / (max_val - min_val)
             return normalized_data
         elif isinstance(data, np.ndarray) and data.ndim == 1:
             # For 1D array (single timestep, multiple features)
             normalized_data = np.zeros_like(data, dtype=float)
             for i in range(data.shape[0]):
+                # Convert data to float, handling any non-numeric values
+                feature_data = float(data[i])
                 min_val = self.sensor_range.lower(i)
                 max_val = self.sensor_range.upper(i)
-                normalized_data[i] = (data[i] - min_val) / (max_val - min_val)
+                normalized_data[i] = (feature_data - min_val) / (max_val - min_val)
             return normalized_data
         else:
             # For scalar value (single feature)
             min_val = self.sensor_range.lower(0)
             max_val = self.sensor_range.upper(0)
-            return (data - min_val) / (max_val - min_val)
+            return (float(data) - min_val) / (max_val - min_val)
             
     def __reverse_normalized_data(self, data, feature_idx=0):
         """Reverse normalization for a specific feature"""
@@ -172,7 +176,6 @@ class AdapAD:
     def __is_default_normal(self):
         # Add debugging print
         result = self.observed_vals.get_length() <= self.predictor_config['train_size'] + self.predictor_config['lookback_len']
-        print(f"__is_default_normal check: {result} (length: {self.observed_vals.get_length()}, train_size+lookback: {self.predictor_config['train_size'] + self.predictor_config['lookback_len']})")
         return result
             
     def __logging(self, is_anomalous_ret):
@@ -230,59 +233,16 @@ class AdapAD:
             
     def is_anomalous(self, observed_val):
         is_anomalous_ret = False
-
-        supposed_anomalous_pos = self.observed_vals.get_length() + 1  # Next position
-
-        # Check if observed_val is a list, tuple, or other iterable but not a string
+        
+        # Check for missing values before processing
         if hasattr(observed_val, '__iter__') and not isinstance(observed_val, str):
-            # Convert to numpy array if it's not already
-            if not isinstance(observed_val, np.ndarray):
-                observed_val = np.array(observed_val, dtype=float)
-            
-            # Check for missing values in any feature
             if np.any(np.equal(observed_val, -999)) or np.any(np.isnan(observed_val)) or len(observed_val) == 0:
-                # Handle missing value as anomaly but don't update the model
                 is_anomalous_ret = True
-                # Use a placeholder value for logging
-                self.f_log = open(self.f_name, 'a')
-                text2write = '{},{},{},{},{},{},{},{}\n'.format(
-                    supposed_anomalous_pos,  # timestamp
-                    -999,  # observed value for target feature
-                    'nan',  # predicted value
-                    'nan',  # low bound
-                    'nan',  # high bound
-                    is_anomalous_ret,  # anomaly flag
-                    'nan',  # error
-                    self.minimal_threshold,  # threshold
-                    'nan'   # attention weights
-                )
-                self.f_log.write(text2write)
-                self.f_log.close()
-                return is_anomalous_ret
-        else:
-            # Handle scalar case (single feature)
-            if observed_val == -999 or observed_val == '' or observed_val is None or (isinstance(observed_val, float) and math.isnan(observed_val)):
-                is_anomalous_ret = True
-                # Use a placeholder value for logging
-                self.f_log = open(self.f_name, 'a')
-                text2write = '{},{},{},{},{},{},{},{}\n'.format(
-                    supposed_anomalous_pos,  # timestamp
-                    -999,  # observed value
-                    'nan',  # predicted value
-                    'nan',  # low bound
-                    'nan',  # high bound
-                    is_anomalous_ret,  # anomaly flag
-                    'nan',  # error
-                    self.minimal_threshold,  # threshold
-                    'nan'   # attention weights
-                )
-                self.f_log.write(text2write)
-                self.f_log.close()
+                self.__logging(is_anomalous_ret)
                 return is_anomalous_ret
         
         # save observed vals to the object
         observed_val = np.array(observed_val, dtype=float)
-        observed_val_original = observed_val.copy()  # Keep original for debugging
         observed_val = self.__normalize_data(observed_val)
         self.observed_vals.append(observed_val)
         supposed_anomalous_pos = self.observed_vals.get_length()
@@ -292,67 +252,51 @@ class AdapAD:
         predicted_val = self.data_predictor.predict(past_observations)
         self.predicted_vals.append(predicted_val)
         
-        # Check if value is outside normal range
-        range_violation = False
-        for feature_idx in range(len(observed_val)):
-            if not self.is_inside_range(observed_val[feature_idx], feature_idx):
-                self.anomalies.append(supposed_anomalous_pos)
-                is_anomalous_ret = True
-                range_violation = True
-                print(f"Range violation detected for feature {feature_idx}")
-                break
-        
-        # Get past prediction errors
-        past_predictive_errors = self.predictive_errors.get_tail(self.predictor_config['lookback_len'])
-        past_predictive_errors = torch.from_numpy(np.array(past_predictive_errors).reshape(1, -1)).float()
-        
-        # Generate threshold
-        threshold = self.generator.generate(past_predictive_errors, self.minimal_threshold)
-        self.thresholds.append(threshold)
-
-        # Calculate prediction error for target feature
-        prediction_error = NormalDataPredictionErrorCalculator.calc_error(
-            predicted_val, 
-            observed_val[self.target_feature]
-        )
-        self.predictive_errors.append(prediction_error)
-        
-        # Debug print
-        print(f"Position: {supposed_anomalous_pos}, Error: {prediction_error}, Threshold: {threshold}")
-        
-        # Check if prediction error exceeds threshold
-        if not range_violation and prediction_error > threshold:
-            print(f"Error {prediction_error} exceeds threshold {threshold}")
-            if not self.__is_default_normal():
-                print("Not default normal, marking as anomalous")
-                is_anomalous_ret = True
-                self.anomalies.append(supposed_anomalous_pos)
-            else:
-                print("Default normal, not marking as anomalous")
-        
-        # Add debug print to help diagnose the issue
-        print(f"Final anomaly decision: {is_anomalous_ret}, Range violation: {range_violation}, Error: {prediction_error}, Threshold: {threshold}")
-        
-        # Update models
-        self.data_predictor.update(
-            config.epoch_update, 
-            config.lr_update, 
-            past_observations, 
-            observed_val[self.target_feature]
-        )
+        # perform range check for target feature
+        if not self.is_inside_range(observed_val[self.target_feature], self.target_feature):
+            self.anomalies.append(supposed_anomalous_pos)
+            is_anomalous_ret = True
+        else:
+            self.generator.eval()
+            past_predictive_errors = self.predictive_errors.get_tail(self.predictor_config['lookback_len'])
+            past_predictive_errors = torch.from_numpy(np.array(past_predictive_errors).reshape(1, -1)).float()
             
-        if is_anomalous_ret or threshold > self.minimal_threshold:
-            self.generator.update(
-                config.update_G_epoch,
-                config.update_G_lr,
-                past_predictive_errors, 
-                prediction_error
-            )
+            with torch.no_grad():       
+                threshold = self.generator(past_predictive_errors)
+                threshold = threshold.data.numpy()
+                threshold = max(threshold[0,0], self.minimal_threshold)
+            self.thresholds.append(threshold)
         
+            prediction_error = NormalDataPredictionErrorCalculator.calc_error(
+                predicted_val, 
+                observed_val[self.target_feature]
+            )
+            self.predictive_errors.append(prediction_error)
+            
+            if prediction_error > threshold:
+                if not self.__is_default_normal():
+                    is_anomalous_ret = True
+                    self.anomalies.append(supposed_anomalous_pos)
+            
+            self.data_predictor.update(
+                config.epoch_update, 
+                config.lr_update, 
+                past_observations, 
+                observed_val[self.target_feature]
+            )
+                
+            if is_anomalous_ret or threshold > self.minimal_threshold:
+                self.generator.update(
+                    config.update_G_epoch,
+                    config.update_G_lr,
+                    past_predictive_errors, 
+                    prediction_error
+                )
+            
         self.__logging(is_anomalous_ret)
             
         return is_anomalous_ret
-        
+
     def clean(self):
         self.predicted_vals.clean(self.predictor_config['lookback_len'])
         self.predictive_errors.clean(self.predictor_config['lookback_len'])
@@ -388,15 +332,19 @@ if __name__ == "__main__":
     
     print(f"Using features: {feature_columns}")
     
+    # Extract data from dataframe
+    # Convert all data to numeric values, coercing errors to NaN
+    for col in feature_columns:
+        data_source[col] = pd.to_numeric(data_source[col], errors='coerce')
+    
+    data_values = data_source[feature_columns].values
+    len_data_subject = len(data_values)
+    
     # AdapAD
     AdapAD_obj = AdapAD(predictor_config, value_range_config, minimal_threshold, feature_columns)
     print('GATHERING DATA FOR TRAINING...', predictor_config['train_size'])
     
     observed_data = []
-    
-    # Extract data from dataframe
-    data_values = data_source[feature_columns].values
-    len_data_subject = len(data_values)
     
     for data_idx in range(len_data_subject):
         measured_values = data_values[data_idx]

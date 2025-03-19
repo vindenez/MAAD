@@ -4,8 +4,8 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 # File paths
-original_data_path = 'data/data_3716_20230829_0400_to_20231114_1300 copy.csv'
-anomaly_data_path = 'results/conductivity/att_lstm_0.007.csv'
+original_data_path = 'data/Conductivity copy.csv'
+anomaly_data_path = 'results/conductivity/att-lstm_0.0128.csv'
 
 # Configuration based on provided config file
 feature_columns = [
@@ -73,7 +73,7 @@ if not anomalies.empty:
     anomaly_timesteps = anomalies['timestep'].values
     
     for timestep in anomaly_timesteps:
-        plt.axvline(x=timestep, color='red', linestyle='-', alpha=0.7)
+        plt.axvline(x=timestep, color='red', linestyle='-', alpha=0.3, linewidth=2.5)
     
     # Reset the y-limits after adding vertical lines
     plt.gca().set_ylim(ylim)
@@ -90,7 +90,7 @@ plt.axhline(y=1, color='gray', linestyle='-', alpha=0.5, linewidth=1)
 plt.ylim(0, 1)
 
 # Create custom legend with anomaly marker
-anomaly_line = Line2D([0], [0], color='red', linestyle='solid', linewidth=2)
+anomaly_line = Line2D([0], [0], color='red', linestyle='solid', linewidth=2.5, alpha=0.3)
 handles, labels = plt.gca().get_legend_handles_labels()
 handles.append(anomaly_line)
 labels.append('Anomalies')

@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 # File paths
-original_data_path = 'data/data_3716_20230829_0400_to_20231114_1300 copy.csv'
+original_data_path = 'data/Conductivity copy.csv'
 anomaly_data_path = 'results/data3716att-lstm/att_lstm_0.007.csv'
 
 # Configuration based on provided config file
