@@ -5,7 +5,7 @@ from matplotlib.lines import Line2D
 
 # File paths
 original_data_path = 'data/Conductivity copy.csv'
-anomaly_data_path = 'results/conductivity/att-lstm_0.0128.csv'
+anomaly_data_path = 'results/conductivity/att-lstm_0.01.csv'
 
 # Configuration based on provided config file
 feature_columns = [
@@ -18,7 +18,7 @@ feature_columns = [
 
 # Value range configuration for normalization
 value_range_config = {
-    0: (25.0, 36.0),     # conductivity_conductivity
+    0: (25.0, 38.0),     # conductivity_conductivity
     1: (2.0, 20.0),      # conductivity_temperature
     2: (18.0, 32.0),     # conductivity_salinity
     3: (1008.0, 1030.0), # conductivity_density
@@ -109,7 +109,7 @@ plt.grid(True, linestyle='--', alpha=0.7)
 
 # Tight layout and save
 plt.tight_layout()
-plt.savefig('normalized_conductivity_with_all_anomalies.png', dpi=300)
+plt.savefig('graphs/multivariate_anomalies.png', dpi=300)
 
 print("Visualization complete. All anomalies should now be properly plotted.")
 print("The plot has been generated and saved as 'normalized_conductivity_with_all_anomalies.png'")

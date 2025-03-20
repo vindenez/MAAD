@@ -195,9 +195,9 @@ for feature_name, data in feature_predictions.items():
     
     # Save the figure
     plt.tight_layout()
-    plt.savefig(f'{feature_name}_observed_vs_predicted.png', dpi=300)
     plt.close()
 
+plt.savefig(f'graphs/univariates_anomalies.png', dpi=300)
 plt.show()
 
 print("Visualization complete. All plots have been generated.")
