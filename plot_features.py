@@ -64,7 +64,7 @@ for i, col in enumerate(feature_columns):
     # Plot using timesteps on x-axis
     plt.plot(valid_data['timestep'], normalized_values, label=col, linewidth=1.5)
 
-# Mark all anomalies with vertical lines
+""" # Mark all anomalies with vertical lines
 if not anomalies.empty:
     # Get current y-axis limits
     ylim = plt.gca().get_ylim()
@@ -80,7 +80,7 @@ if not anomalies.empty:
 
     # Add text label for the number of anomalies
     plt.text(0.02, 0.02, f"Total anomalies: {len(anomalies)}", transform=plt.gca().transAxes, 
-             bbox=dict(facecolor='white', alpha=0.7), fontsize=10)
+             bbox=dict(facecolor='white', alpha=0.7), fontsize=10) """
 
 # Add reference lines at 0 and 1 to show the normal range
 plt.axhline(y=0, color='gray', linestyle='-', alpha=0.5, linewidth=1)

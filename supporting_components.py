@@ -4,6 +4,31 @@ import config as config
 class NormalDataPredictionErrorCalculator():
     @staticmethod
     def calc_error(ground_truth, predict):
+        """
+        Calculate reconstruction error for multivariate time series.
+        
+        Args:
+            ground_truth: Observed values (array-like)
+            predict: Predicted values (array-like)
+            
+        Returns:
+            error: Reconstruction error (scalar)
+        """
+        # Calculate mean squared error across all features
+        return np.mean((ground_truth - predict)**2)
+        
+    @staticmethod
+    def calc_feature_errors(ground_truth, predict):
+        """
+        Calculate reconstruction errors for each feature.
+        
+        Args:
+            ground_truth: Observed values (array-like)
+            predict: Predicted values (array-like)
+            
+        Returns:
+            errors: Array of errors for each feature
+        """
         return (ground_truth - predict)**2
         
 class NormalValueRangeDb():
@@ -11,16 +36,14 @@ class NormalValueRangeDb():
         _, self.__value_range, _ = config.init_config()
         
     def lower(self, feature_idx=0):
-        if isinstance(self.__value_range, tuple):
-            return self.__value_range[0]
-        else:
-            return self.__value_range[feature_idx][0]
+        # Get the feature name from the config
+        feature_name = config.feature_columns[feature_idx]
+        return self.__value_range[feature_name][0]
         
     def upper(self, feature_idx=0):
-        if isinstance(self.__value_range, tuple):
-            return self.__value_range[1]
-        else:
-            return self.__value_range[feature_idx][1]
+        # Get the feature name from the config
+        feature_name = config.feature_columns[feature_idx]
+        return self.__value_range[feature_name][1]
         
 class PredictedNormalDataDb():
     def __init__(self):
@@ -88,10 +111,24 @@ class AnomalousThresholdDb():
         
 class PredictionErrorDb():
     def __init__(self, prediction_error_training):
-        self.prediction_errors = prediction_error_training.copy()
+        # Handle both scalar and array inputs
+        self.prediction_errors = []
+        for err in prediction_error_training:
+            if isinstance(err, (list, np.ndarray)):
+                # If it's an array, take the mean
+                self.prediction_errors.append(float(np.mean(err)))
+            else:
+                # If it's already a scalar
+                self.prediction_errors.append(float(err))
         
     def append(self, val):
-        self.prediction_errors.append(val)
+        # Handle both scalar and array inputs
+        if isinstance(val, (list, np.ndarray)):
+            # If it's an array, take the mean
+            self.prediction_errors.append(float(np.mean(val)))
+        else:
+            # If it's already a scalar
+            self.prediction_errors.append(float(val))
     
     def get_tail(self, length=1):
         if length == 1:
