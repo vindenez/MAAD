@@ -106,11 +106,18 @@ class AdapAD:
         # Create a PredictionErrorDb with scalar errors
         self.predictive_errors = PredictionErrorDb(errors.tolist())
         
-        # Train the threshold generator directly
+        # Get the errors for generator training
+        original_errors = self.predictive_errors.get_tail(self.predictive_errors.get_length())
+        
+        # Apply log transformation to errors before training the generator
+        log_transformed_errors = self.log_transform_errors(original_errors)
+        print(f"Training generator with log-transformed errors")
+        
+        # Train the threshold generator with log-transformed errors
         self.generator.train(
             config.epoch_train,
             config.lr_train,
-            self.predictive_errors.get_tail(self.predictive_errors.get_length())
+            log_transformed_errors  # Pass the log-transformed errors here
         )
 
     def __init_log_files(self):
@@ -302,21 +309,36 @@ class AdapAD:
             # generate threshold only if we have enough historical errors
             if self.predictive_errors.get_length() >= self.predictor_config['lookback_len']:
                 past_predictive_errors = self.predictive_errors.get_tail(self.predictor_config['lookback_len'])
-                past_errors_array = np.array(past_predictive_errors, dtype=np.float32).reshape(1, -1, 1)
-                past_errors_tensor = torch.Tensor(past_errors_array)
+                
+                # Apply log transformation to handle very small error values
+                log_transformed_errors = self.log_transform_errors(past_predictive_errors)
+                
+                # Create properly shaped input tensor for the generator
+                log_errors_array = log_transformed_errors.reshape(1, -1)
+                log_errors_tensor = torch.Tensor(log_errors_array)
                 
                 with torch.no_grad():
-                    threshold_tensor = self.generator(past_errors_tensor)
-                    threshold = threshold_tensor[0, 0].item()
+                    # Get threshold in log space
+                    log_threshold_tensor = self.generator(log_errors_tensor)
+                    log_threshold = log_threshold_tensor[0, 0].item()
+                    
+                    # The critical fix - convert the log threshold back to the original scale
+                    threshold = 10 ** log_threshold
+                    
+                    print(f"Log threshold: {log_threshold:.4f}, Converted threshold: {threshold:.8f}")
+                    
+                    # Apply bounds
                     threshold = max(threshold, self.minimal_threshold)
+                    threshold = min(threshold, reconstruction_error * 10.0)
+                
                 self.thresholds.append(threshold)
                 
-                # check if error exceeds threshold
+                # Check if error exceeds threshold
                 if reconstruction_error > threshold:
                     is_anomalous_ret = True
                     self.anomalies.append(supposed_anomalous_pos)
                     
-                # update models
+                # Update models
                 self.data_predictor.update(
                     config.epoch_update,
                     config.lr_update,
@@ -325,11 +347,15 @@ class AdapAD:
                 )
                 
                 if is_anomalous_ret or threshold > self.minimal_threshold:
+                    # Transform the current error using the same log transform
+                    log_current_error = self.log_transform_errors([reconstruction_error])[0]
+                    
+                    # Update the generator with log-transformed errors
                     self.generator.update(
                         config.update_G_epoch,
                         config.update_G_lr,
-                        past_errors_tensor,
-                        torch.tensor([[reconstruction_error]], dtype=torch.float32)
+                        log_errors_tensor,
+                        torch.tensor([[log_current_error]], dtype=torch.float32)
                     )
         
         self.__logging(is_anomalous_ret)
@@ -365,6 +391,23 @@ class AdapAD:
             return True
         else:
             return False
+
+    def log_transform_errors(self, errors, epsilon=1e-15):
+        """
+        Apply log transformation to error values to handle wide dynamic range.
+        
+        Args:
+            errors: Array of error values
+            epsilon: Small constant to avoid log(0)
+            
+        Returns:
+            Log-transformed errors
+        """
+        errors_array = np.array(errors) + epsilon
+        log_errors = np.log10(errors_array)
+        # Debug output to verify transformation
+        print(f"Error range: [{np.min(errors_array):.8f}, {np.max(errors_array):.8f}] → Log range: [{np.min(log_errors):.4f}, {np.max(log_errors):.4f}]")
+        return log_errors
 
 if __name__ == "__main__":
     predictor_config, value_range_config, minimal_threshold = config.init_config()

@@ -143,6 +143,7 @@ plt.grid(True, linestyle='--', alpha=0.7)
 
 # Tight layout and save
 plt.tight_layout()
+plt.savefig('figures/sensor_parameters.png', dpi=300)
 plt.show()
 
 print("Visualization complete. Plot saved as 'all_features_normalized_with_anomalies.png'.")

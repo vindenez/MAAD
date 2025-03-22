@@ -186,102 +186,164 @@ class LSTMPredictor(nn.Module):
         
         self.num_classes = num_classes
         self.num_layers = num_layers
-        self.input_size = input_size
+        self.input_size = input_size  # Should be 1 for error values
         self.hidden_size = hidden_size
         self.seq_length = lookback_len
 
+        # LSTM expects input shape [batch, seq_len, features]
         self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size,
                             num_layers=num_layers, batch_first=True)
         self.fc = nn.Linear(in_features=self.hidden_size, out_features=self.num_classes)
 
     def forward(self, x):
-        # Reshape input if needed
         batch_size = x.size(0)
-        if x.dim() == 2:  # If input is [batch_size, seq_length*input_size]
-            x = x.view(batch_size, self.seq_length, self.input_size)
-            
+        
+        # Ensure input has the right shape [batch, seq_len, input_size]
+        if x.dim() == 2:  # [batch, seq_len]
+            x = x.unsqueeze(2)  # [batch, seq_len, 1]
+        
         # Process through LSTM
-        x, (h_out, _) = self.lstm(x)
-        h_out = h_out.view(-1, self.hidden_size)   
+        _, (h_out, _) = self.lstm(x)
+        
+        # Get the hidden state from the last layer
+        h_out = h_out[-1]  # Shape: [batch_size, hidden_size]
+        
+        # Final prediction
         out = self.fc(h_out)
         return out
 
 class AnomalousThresholdGenerator():
-    def __init__(self, lstm_layer, lstm_unit, lookback_len, prediction_len, num_features):
+    def __init__(self, lstm_layer, lstm_unit, lookback_len, prediction_len, num_features, scaling_factor=1.5):
         hidden_size = lstm_unit
         num_layers = lstm_layer
         self.lookback_len = lookback_len
         self.prediction_len = prediction_len
         self.num_features = num_features
+        self.scaling_factor = scaling_factor  # Scale factor for thresholds
         
-        # Create a LSTM predictor for threshold generation
-        # For scalar errors, input_size=1
+        # Create an LSTM model that takes a sequence of lookback_len errors 
+        # and outputs a single threshold value
         self.generator = LSTMPredictor(
-            num_classes=prediction_len,
-            input_size=1,  # For scalar prediction errors
+            num_classes=1,  # Output a single threshold value
+            input_size=1,   # Each time step has 1 feature (error value)
             hidden_size=hidden_size,
             num_layers=num_layers,
             lookback_len=lookback_len
         )
-                    
+        
+        # Initialize with a simple statistical model
+        self.use_statistical_fallback = True
+        
     def train(self, epoch, lr, data2learn):
-        num_epochs = epoch
-        learning_rate = lr
+        # If we have enough data, train the LSTM model
+        if len(data2learn) >= self.lookback_len * 3:  # Need enough data to train
+            self.use_statistical_fallback = False
+            
+            num_epochs = epoch
+            learning_rate = lr
 
-        criterion = torch.nn.MSELoss()    
-        optimizer = torch.optim.Adam(self.generator.parameters(), lr=learning_rate)
-        loss_l = list()
-        
-        # Prepare data
-        x, y = sliding_windows(data2learn, self.lookback_len, self.prediction_len)
-        x, y = x.astype(float), y.astype(float)
-        y = np.reshape(y, (y.shape[0], y.shape[1]))
-        
-        # Prepare data for training
-        train_tensorX = torch.Tensor(np.array(x))
-        train_tensorY = torch.Tensor(np.array(y))
-        
-        # Training loop
-        self.generator.train()
-        for epoch in range(num_epochs):
-            for i in range(len(x)):            
-                optimizer.zero_grad()
+            criterion = torch.nn.MSELoss()    
+            optimizer = torch.optim.Adam(self.generator.parameters(), lr=learning_rate)
+            
+            # Assume data2learn is already log-transformed
+            data2learn = np.array(data2learn).reshape(-1)
+            
+            print(f"Training generator with log-transformed errors. Range: [{np.min(data2learn):.2f}, {np.max(data2learn):.2f}]")
+            
+            # Create input/output pairs for training
+            x, y = sliding_windows(data2learn, self.lookback_len, self.prediction_len)
+            x, y = x.astype(float), y.astype(float)
+            
+            # Prepare data for LSTM
+            x_tensor = torch.Tensor(x).unsqueeze(2)
+            
+            # For target, use the next error value
+            y_tensor = torch.Tensor(y[:, 0]).view(-1, 1)
+            
+            # Training loop
+            self.generator.train()
+            for epoch in range(num_epochs):
+                epoch_loss = 0.0
+                for i in range(len(x_tensor)):
+                    inputs = x_tensor[i:i+1]
+                    target = y_tensor[i:i+1]
+                    
+                    optimizer.zero_grad()
+                    outputs = self.generator(inputs)
+                    loss = criterion(outputs, target)
+                    loss.backward(retain_graph=True)
+                    optimizer.step()
+                    
+                    epoch_loss += loss.item()
                 
-                _x, _y = x[i], y[i]
-                # Reshape input for scalar errors
-                _x_reshaped = torch.Tensor(_x).reshape((1, self.lookback_len, 1))
-                outputs = self.generator(_x_reshaped)
-                loss = criterion(outputs, torch.Tensor(_y).reshape((1,-1)))
+                # Print progress occasionally
+                if (epoch + 1) % 100 == 0:
+                    print(f"Generator training epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss/len(x_tensor):.6f}")
+            
+            return torch.Tensor(x), torch.Tensor(y)
+        else:
+            # Not enough data, will use statistical approach
+            print("Not enough data for training generator, using statistical approach")
+            return torch.Tensor(), torch.Tensor()
+                
+    def update(self, epoch_update, lr_update, past_errors, recent_error):
+        """Update the generator with recent log-transformed error data"""
+        if not self.use_statistical_fallback:
+            num_epochs = epoch_update
+            learning_rate = lr_update
+            
+            criterion = torch.nn.MSELoss()    
+            optimizer = torch.optim.Adam(self.generator.parameters(), lr=learning_rate)
+            
+            # Make sure past_errors has shape [batch, lookback_len, 1]
+            if past_errors.dim() == 2:  # [batch, lookback_len]
+                past_errors = past_errors.unsqueeze(2)
+            
+            # Target is the log-transformed recent error
+            # We don't need additional scaling since we're in log space
+            target = recent_error.view(1, 1)
+            
+            self.generator.train()
+            loss_l = []
+            for epoch in range(num_epochs):
+                optimizer.zero_grad()
+                predicted_val = self.generator(past_errors.float())
+                
+                loss = criterion(predicted_val, target)
                 loss.backward(retain_graph=True)
                 optimizer.step()
                 
-        return train_tensorX, train_tensorY
-                
-    def update(self, epoch_update, lr_update, past_errors, recent_error):
-        num_epochs = epoch_update
-        learning_rate = lr_update
-        
-        criterion = torch.nn.MSELoss()    
-        optimizer = torch.optim.Adam(self.generator.parameters(), lr=learning_rate)
-        
-        self.generator.train()
-        loss_l = list()
-        for epoch in range(num_epochs):
-            predicted_val = self.generator(past_errors.float())
-            optimizer.zero_grad()           
-            loss = criterion(predicted_val, recent_error)
-            loss.backward(retain_graph=True)
-            optimizer.step()
-            # for early stopping
-            if len(loss_l) > 1 and loss.item() > loss_l[-1]:
-              break     
-            loss_l.append(loss.item())
+                # for early stopping
+                if len(loss_l) > 1 and loss.item() > loss_l[-1]:
+                    break
+                loss_l.append(loss.item())
             
     def __call__(self, x):
-        """Allow the class to be called like a function, forwarding to the generator"""
-        self.generator.eval()
-        with torch.no_grad():
-            return self.generator(x)
+        """Generate a threshold based on past log-transformed errors"""
+        if not self.use_statistical_fallback:
+            # Use trained LSTM model
+            self.generator.eval()
+            with torch.no_grad():
+                if x.dim() == 2:  # [batch, lookback_len]
+                    x = x.unsqueeze(2)
+                threshold = self.generator(x)
+                return threshold
+        else:
+            # Statistical fallback for log-transformed errors
+            if isinstance(x, torch.Tensor):
+                x_np = x.cpu().numpy()
+            else:
+                x_np = np.array(x)
+            
+            # For log-transformed errors, we can use simpler statistics
+            mean_log_error = np.mean(x_np)
+            std_log_error = np.std(x_np)
+            
+            # A reasonable threshold in log space is mean + k*std
+            log_threshold = mean_log_error + 2.0 * std_log_error
+            
+            # Convert back to tensor
+            return torch.tensor([[log_threshold]], dtype=torch.float32)
 
 class LSTMAutoencoder(nn.Module):
     def __init__(self, num_features, hidden_size, num_layers, lookback_len):
