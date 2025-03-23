@@ -6,25 +6,29 @@ import os
 import glob
 
 # Configuration
-original_data_path = 'data/Conductivity copy.csv'
+original_data_path = 'data/Austevoll_Autumn_2023_no_dcps copy.csv'
 logs_directory = 'results/adapad_logs/'
 
-# Feature configuration
+# Feature configuration (only uncommented columns)
 feature_columns = [
     "conductivity_conductivity", 
-    "conductivity_temperature", 
-    "conductivity_salinity",
-    "conductivity_density", 
-    "conductivity_soundspeed"
+    #"conductivity_temperature", 
+    #"conductivity_salinity",
+    #"conductivity_density", 
+    #"conductivity_soundspeed",
+    "pressure_pressure",
+    "pressure_temperature"
 ]
 
-# Value range configuration for normalization
+# Value range configuration for normalization (only uncommented columns)
 value_range_config = {
     "conductivity_conductivity": (25.0, 38.0),
-    "conductivity_temperature": (2.0, 20.0),
-    "conductivity_salinity": (18.0, 32.0),
-    "conductivity_density": (1008.0, 1030.0),
-    "conductivity_soundspeed": (1460.0, 1510.0)
+    #conductivity_temperature": (5.0, 17.0),
+    #"conductivity_salinity": (18.0, 32.0),
+    #"conductivity_density": (1008.0, 1030.0),
+    #"conductivity_soundspeed": (1460.0, 1510.0),
+    "pressure_pressure": (299.0, 321.0),
+    "pressure_temperature": (5.0, 17.0)
 }
 
 # Load the original dataset
@@ -46,11 +50,15 @@ print(f"Found {len(log_files)} log files: {log_files}")
 
 # Create a dictionary to store anomalies for each feature
 feature_anomalies = {}
-feature_predictions = {}
 
-# Load each log file and extract anomalies
+# Load each log file and extract anomalies (only for uncommented columns)
 for log_file in log_files:
     feature_name = os.path.basename(log_file).replace('_log.csv', '')
+    
+    # Only process uncommented columns
+    if feature_name not in feature_columns:
+        continue
+    
     print(f"Processing {feature_name} from {log_file}")
     
     try:
@@ -64,15 +72,6 @@ for log_file in log_files:
         anomalies = log_df[log_df['anomalous'] == True]
         feature_anomalies[feature_name] = anomalies['timestep'].tolist() if not anomalies.empty else []
         
-        # Store predictions for plotting
-        feature_predictions[feature_name] = {
-            'observed': log_df['observed'].values,
-            'predicted': log_df['predicted'].values,
-            'low': log_df['low'].values,
-            'high': log_df['high'].values,
-            'timesteps': log_df['timestep'].values
-        }
-        
         print(f"  - Found {len(feature_anomalies[feature_name])} anomalies")
     except Exception as e:
         print(f"Error processing {log_file}: {e}")
@@ -80,7 +79,7 @@ for log_file in log_files:
 # Create a figure for normalized values
 plt.figure(figsize=(16, 8))
 
-# Plot normalized original data for each feature
+# Plot normalized original data for each uncommented feature
 for feature in feature_columns:
     if feature in original_df.columns:
         # Get valid data for this parameter (drop NaN values)
@@ -95,7 +94,7 @@ for feature in feature_columns:
         # Plot using timesteps on x-axis
         plt.plot(valid_data['timestep'], normalized_values, label=feature, linewidth=1.5)
 
-# Mark all anomalies with vertical lines
+# Mark all anomalies with vertical lines (only for uncommented columns)
 all_anomaly_timesteps = []
 for feature, anomalies in feature_anomalies.items():
     all_anomaly_timesteps.extend(anomalies)
@@ -135,7 +134,7 @@ plt.legend(handles=handles, labels=labels, loc='upper right', fontsize=10)
 plt.xlim(1, len(original_df))
 
 # Add title and labels
-plt.title('Normalized Conductivity Parameters with All Anomalies', fontsize=14)
+plt.title('Normalized Pressure Parameters with All Anomalies', fontsize=14)
 plt.xlabel('Timestep', fontsize=12)
 plt.ylabel('Normalized Value [0-1]', fontsize=12)
 
@@ -144,60 +143,7 @@ plt.grid(True, linestyle='--', alpha=0.7)
 
 # Tight layout and save
 plt.tight_layout()
-plt.savefig('all_features_normalized_with_anomalies.png', dpi=300)
-
-# Create individual plots for each feature showing observed vs predicted values
-for feature_name, data in feature_predictions.items():
-    plt.figure(figsize=(16, 6))
-    
-    # Get the original feature name from the log file name
-    original_feature = None
-    for col in feature_columns:
-        if col in feature_name:
-            original_feature = col
-            break
-    
-    if original_feature is None:
-        print(f"Could not determine original feature for {feature_name}, skipping...")
-        continue
-        
-    # Get normalization range
-    min_val, max_val = value_range_config.get(original_feature, (0, 1))
-    
-    # Plot observed values
-    plt.plot(data['timesteps'], data['observed'], 'b-', label='Observed', linewidth=1.5)
-    
-    # Plot predicted values
-    plt.plot(data['timesteps'], data['predicted'], 'g-', label='Predicted', linewidth=1.5)
-    
-    # Plot prediction bounds
-    plt.fill_between(data['timesteps'], data['low'], data['high'], color='g', alpha=0.2, label='Prediction Bounds')
-    
-    # Mark anomalies
-    if feature_name in feature_anomalies:
-        for timestep in feature_anomalies[feature_name]:
-            plt.axvline(x=timestep, color='red', linestyle='-', alpha=0.5, linewidth=1.5)
-    
-    # Add title and labels
-    plt.title(f'{original_feature} - Observed vs Predicted Values', fontsize=14)
-    plt.xlabel('Timestep', fontsize=12)
-    plt.ylabel('Value', fontsize=12)
-    
-    # Add legend
-    anomaly_line = Line2D([0], [0], color='red', linestyle='solid', linewidth=1.5, alpha=0.5)
-    handles, labels = plt.gca().get_legend_handles_labels()
-    handles.append(anomaly_line)
-    labels.append('Anomalies')
-    plt.legend(handles=handles, labels=labels, loc='best', fontsize=10)
-    
-    # Add grid
-    plt.grid(True, linestyle='--', alpha=0.7)
-    
-    # Save the figure
-    plt.tight_layout()
-    plt.close()
-
-plt.savefig(f'graphs/univariates_anomalies.png', dpi=300)
+#plt.savefig('figures/sensor_parameters.png', dpi=300)
 plt.show()
 
-print("Visualization complete. All plots have been generated.")
+print("Visualization complete. Plot saved as 'all_features_normalized_with_anomalies.png'.")
