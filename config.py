@@ -33,7 +33,7 @@ attention_size = 32  # Size of attention layer
 
 # Training parameters
 epoch_train = 500  # Epochs for initial training
-lr_train = 0.001  # Learning rate for initial training
+lr_train = 0.0005  # Learning rate for initial training
 
 # Update parameters
 epoch_update = 50  # Epochs for online updates
@@ -41,7 +41,7 @@ lr_update = 0.001  # Learning rate for online updates
 
 # Threshold generator parameters
 update_G_epoch = 50  # Epochs for threshold generator updates
-update_G_lr = 0.00005  # Learning rate for threshold generator updates
+update_G_lr = 0.0005  # Learning rate for threshold generator updates
 
 # Attention parameters
 attention_dropout = 0.1  # Dropout rate for attention layer
@@ -63,7 +63,7 @@ def init_config():
                                      predictor_config['prediction_len'] 
     
     # Minimal threshold for anomaly detection
-    minimal_threshold = 0.00001
+    minimal_threshold = 0.001
     
     return predictor_config, value_range_config, minimal_threshold
 
