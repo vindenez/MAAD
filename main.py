@@ -26,21 +26,39 @@ class AdapAD:
         
         self.sensor_range = NormalValueRangeDb()
         
+        # Prepare feature weights if they exist in config
+        feature_weights = None
+        if hasattr(config, 'weight_config'):
+            # Get weights in the same order as feature_columns
+            feature_weights = []
+            for feature in feature_columns:
+                if feature in config.weight_config:
+                    feature_weights.append(config.weight_config[feature])
+                else:
+                    # Default weight if not specified
+                    feature_weights.append(1.0 / len(feature_columns))
+                    
+            # Normalize weights to sum to 1
+            weight_sum = sum(feature_weights)
+            if weight_sum != 1.0:
+                feature_weights = [w / weight_sum for w in feature_weights]
+        
         self.data_predictor = MultivariateNormalDataPredictor(
             lstm_layer=config.LSTM_size_layer,
             lstm_unit=config.LSTM_size,
             lookback_len=self.predictor_config['lookback_len'],
             prediction_len=self.predictor_config['prediction_len'],
-            num_features=self.num_features
+            num_features=self.num_features,
+            bottleneck_size=config.bottleneck_size,
+            feature_weights=feature_weights  
         )
         
-        self.generator = LSTMPredictor(
+        self.generator = AttentionAwareThresholdGenerator(
             self.predictor_config['prediction_len'], 
             self.predictor_config['lookback_len'], 
             config.LSTM_size, 
-            config.LSTM_size_layer, 
-            self.predictor_config['lookback_len']
-        ) 
+            config.LSTM_size_layer
+        )
         
         self.predicted_vals = PredictedNormalDataDb()
         self.thresholds = AnomalousThresholdDb()
@@ -126,15 +144,39 @@ class AdapAD:
         
         observed_np = np.array(observed)
         
-        # Calculate squared differences for each feature
-        squared_diffs = (predicted_for_comparison - observed_np) ** 2
+        # Convert to tensors
+        predicted_tensor = torch.tensor(predicted_for_comparison).view(1, 1, -1)
+        observed_tensor = torch.tensor(observed_np).view(1, 1, -1)
         
-        # Calculate MSE
-        mse = np.mean(squared_diffs)
+        # Calculate squared differences
+        with torch.no_grad():
+            squared_diff = (predicted_tensor - observed_tensor) ** 2
+            
+            # Try to get attention-based weights first
+            attention_weights = self.data_predictor.get_attention_weights()
+            
+            if attention_weights is not None:
+                # Use the learned attention weights
+                weights = attention_weights.to(predicted_tensor.device)
+                # Make sure weights are properly normalized
+                weights = weights / torch.sum(weights)
+            elif hasattr(self.data_predictor.criterion, 'feature_weights'):
+                # Fall back to configured weights if no attention weights
+                weights = self.data_predictor.criterion.feature_weights.to(predicted_tensor.device)
+                weights = weights / torch.sum(weights)
+            else:
+                # Last resort - equal weights
+                weights = torch.ones(self.num_features, device=predicted_tensor.device)
+                weights = weights / torch.sum(weights)
+            
+            # Apply weights to errors
+            feature_errors = torch.mean(squared_diff, dim=[0, 1])
+            weighted_errors = feature_errors * weights
+            weighted_error = torch.sum(weighted_errors).item()
         
-        return mse
+        return weighted_error
 
-    def __logging(self, is_anomalous_ret):
+    def __logging(self, is_anomalous_ret, reconstruction_error=None):
         try:
             # Ensure log directory exists
             if not os.path.exists(config.log_dir):
@@ -154,10 +196,12 @@ class AdapAD:
                 # Get the current observation
                 current_observation = self.observed_vals.get_tail(1)
                 
-                reconstruction_error = self.calculate_reconstruction_error(
-                    predicted,
-                    np.array(current_observation)
-                )
+                # Use the provided reconstruction_error if available, otherwise calculate it
+                if reconstruction_error is None:
+                    reconstruction_error = self.calculate_reconstruction_error(
+                        predicted,
+                        np.array(current_observation)
+                    )
                 
                 # Get the current threshold (if available)
                 threshold = self.thresholds.get_tail(1) if self.thresholds.get_length() > 0 else self.minimal_threshold
@@ -250,14 +294,25 @@ class AdapAD:
         past_observations = np.array(past_observations)
         past_observations_tensor = torch.Tensor(past_observations.reshape(1, -1))
         
+        # Update attention weights in the generator before using it
+        attention_weights = self.data_predictor.get_attention_weights()
+        if attention_weights is not None:
+            self.generator.set_attention_weights(attention_weights)
+        
+        # Get prediction
         predicted_val = self.data_predictor.predict(past_observations_tensor)
         self.predicted_vals.append(predicted_val)
+        
+        # Calculate reconstruction error with current attention weights
+        reconstruction_error = self.calculate_reconstruction_error(predicted_val, normalized_val)
+        
+        # Store the calculated error to use the same value in logging
+        self.last_reconstruction_error = reconstruction_error
         
         if not all(self.is_inside_range(x, i) for i, x in enumerate(normalized_val)):
             self.anomalies.append(supposed_anomalous_pos)
             is_anomalous_ret = True
         else:
-            reconstruction_error = self.calculate_reconstruction_error(predicted_val, normalized_val)
             self.predictive_errors.append(reconstruction_error)
             
             # generate threshold only if there are enough historical errors
@@ -289,7 +344,8 @@ class AdapAD:
                 if is_anomalous_ret or threshold > self.minimal_threshold:
                     self.__update_generator(past_errors_tensor, reconstruction_error)
         
-        self.__logging(is_anomalous_ret)
+        # Pass the pre-calculated error to logging
+        self.__logging(is_anomalous_ret, reconstruction_error)
         return is_anomalous_ret
 
     def __update_generator(self, past_predictive_errors, prediction_error):
