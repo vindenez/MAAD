@@ -26,31 +26,13 @@ class AdapAD:
         
         self.sensor_range = NormalValueRangeDb()
         
-        # Prepare feature weights if they exist in config
-        feature_weights = None
-        if hasattr(config, 'weight_config'):
-            # Get weights in the same order as feature_columns
-            feature_weights = []
-            for feature in feature_columns:
-                if feature in config.weight_config:
-                    feature_weights.append(config.weight_config[feature])
-                else:
-                    # Default weight if not specified
-                    feature_weights.append(1.0 / len(feature_columns))
-                    
-            # Normalize weights to sum to 1
-            weight_sum = sum(feature_weights)
-            if weight_sum != 1.0:
-                feature_weights = [w / weight_sum for w in feature_weights]
-        
         self.data_predictor = MultivariateNormalDataPredictor(
             lstm_layer=config.LSTM_size_layer,
             lstm_unit=config.LSTM_size,
             lookback_len=self.predictor_config['lookback_len'],
             prediction_len=self.predictor_config['prediction_len'],
             num_features=self.num_features,
-            bottleneck_size=config.bottleneck_size,
-            feature_weights=feature_weights  
+            bottleneck_size=config.bottleneck_size
         )
         
         self.generator = AttentionAwareThresholdGenerator(
@@ -253,12 +235,19 @@ class AdapAD:
                 if not hasattr(self, 'main_log_file'):
                     self.main_log_file = f"{config.log_dir}/system_experiment_log.csv"
                     with open(self.main_log_file, 'w') as f:
-                        header = "idx,is_anomalous,error,threshold\n"
+                        # Add feature weight columns to header
+                        feature_weight_headers = ','.join([f"weight_{i}" for i in range(self.num_features)])
+                        header = f"idx,is_anomalous,error,threshold,{feature_weight_headers}\n"
                         f.write(header)
                 
-                # Log overall system metrics
+                # Get current feature weights
+                current_weights = self.data_predictor.criterion.feature_weights.detach().cpu().numpy()
+                
+                # Log overall system metrics with weights
                 with open(self.main_log_file, 'a') as f:
-                    text2write = f"{current_idx},{reconstruction_error > threshold},{reconstruction_error},{threshold}\n"
+                    # Format weights as strings
+                    weight_values = ','.join([f"{w:.6f}" for w in current_weights])
+                    text2write = f"{current_idx},{reconstruction_error > threshold},{reconstruction_error},{threshold},{weight_values}\n"
                     f.write(text2write)
                 
                 
@@ -283,31 +272,45 @@ class AdapAD:
             
         # Normalize data
         normalized_val = self.__normalize_data(observed_val)
-        self.observed_vals.append(normalized_val)
-        supposed_anomalous_pos = self.observed_vals.get_length()
         
-        # Prepare data for prediction
+        # Get past observations BEFORE adding current value
         past_observations = self.observed_vals.get_tail(self.predictor_config['lookback_len'])
         if len(past_observations) < self.predictor_config['lookback_len']:
+            self.observed_vals.append(normalized_val)  # Add current value after checking
             return False  
             
+        # Make prediction using only past data
         past_observations = np.array(past_observations)
         past_observations_tensor = torch.Tensor(past_observations.reshape(1, -1))
         
-        # Update attention weights in the generator before using it
-        attention_weights = self.data_predictor.get_attention_weights()
-        if attention_weights is not None:
-            self.generator.set_attention_weights(attention_weights)
-        
-        # Get prediction
+        # Get prediction before adding current value
         predicted_val = self.data_predictor.predict(past_observations_tensor)
-        self.predicted_vals.append(predicted_val)
         
         # Calculate reconstruction error with current attention weights
         reconstruction_error = self.calculate_reconstruction_error(predicted_val, normalized_val)
         
-        # Store the calculated error to use the same value in logging
-        self.last_reconstruction_error = reconstruction_error
+        # Get threshold using errors from one timestep behind
+        # Only if we have enough historical errors
+        if self.predictive_errors is not None and self.predictive_errors.get_length() >= self.predictor_config['lookback_len']:
+            self.generator.eval()
+            # Get errors from t-4, t-3, t-2 (one step behind predictor window)
+            past_predictive_errors = self.predictive_errors.get_tail(self.predictor_config['lookback_len'])[:-1]
+            
+            past_errors_tensor = torch.from_numpy(np.array(past_predictive_errors).reshape(1, -1)).float()
+            
+            with torch.no_grad():
+                threshold = self.generator(past_errors_tensor)
+                threshold = threshold.data.numpy()
+                threshold = max(threshold[0, 0], self.minimal_threshold)
+            
+            self.thresholds.append(threshold)
+        else:
+            threshold = self.minimal_threshold
+        
+        # Now add the current value and error to our history
+        self.observed_vals.append(normalized_val)
+        supposed_anomalous_pos = self.observed_vals.get_length()
+        self.predicted_vals.append(predicted_val)
         
         if not all(self.is_inside_range(x, i) for i, x in enumerate(normalized_val)):
             self.anomalies.append(supposed_anomalous_pos)
@@ -315,33 +318,22 @@ class AdapAD:
         else:
             self.predictive_errors.append(reconstruction_error)
             
-            # generate threshold only if there are enough historical errors
-            if self.predictive_errors.get_length() >= self.predictor_config['lookback_len']:
-                self.generator.eval()
-                past_predictive_errors = self.predictive_errors.get_tail(self.predictor_config['lookback_len'])
-                
-                past_errors_tensor = torch.from_numpy(np.array(past_predictive_errors).reshape(1, -1)).float()
-                
-                with torch.no_grad():
-                    threshold = self.generator(past_errors_tensor)
-                    threshold = threshold.data.numpy()
-                    threshold = max(threshold[0, 0], self.minimal_threshold)
-                
-                self.thresholds.append(threshold)
-                
-                # Check if error exceeds threshold
-                if reconstruction_error > threshold:
-                    is_anomalous_ret = True
-                    self.anomalies.append(supposed_anomalous_pos)
-                
-                self.data_predictor.update(
-                    config.epoch_update,
-                    config.lr_update,
-                    past_observations_tensor,
-                    normalized_val
-                )
-                
-                if is_anomalous_ret or threshold > self.minimal_threshold:
+            # Check if error exceeds threshold
+            if reconstruction_error > threshold:
+                is_anomalous_ret = True
+                self.anomalies.append(supposed_anomalous_pos)
+            
+            # Update predictor using past observations
+            self.data_predictor.update(
+                config.epoch_update,
+                config.lr_update,
+                past_observations_tensor,
+                normalized_val
+            )
+            
+            # Update generator using lagged error window
+            if is_anomalous_ret or threshold > self.minimal_threshold:
+                if len(past_predictive_errors) >= self.predictor_config['lookback_len']:
                     self.__update_generator(past_errors_tensor, reconstruction_error)
         
         # Pass the pre-calculated error to logging

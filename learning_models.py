@@ -181,7 +181,7 @@ class LSTMAutoencoder(nn.Module):
         return output
 
 class MultivariateNormalDataPredictor():
-    def __init__(self, lstm_layer, lstm_unit, lookback_len, prediction_len, num_features, bottleneck_size=1, feature_weights=None):
+    def __init__(self, lstm_layer, lstm_unit, lookback_len, prediction_len, num_features, bottleneck_size=1):
         hidden_size = lstm_unit
         num_layers = lstm_layer
         self.lookback_len = lookback_len
@@ -189,7 +189,7 @@ class MultivariateNormalDataPredictor():
         self.num_features = num_features
         self.bottleneck_size = bottleneck_size
         
-        # Use the new AttentionLSTMAutoencoder
+        # Use the AttentionLSTMAutoencoder
         self.predictor = AttentionLSTMAutoencoder(
             num_features=num_features,
             bottleneck_size=bottleneck_size,
@@ -197,22 +197,21 @@ class MultivariateNormalDataPredictor():
             lookback_len=lookback_len
         )
         
-        # Initialize the weighted loss function
-        if feature_weights is not None:
-            self.criterion = FeatureWeightedMSELoss(num_features, initial_weights=feature_weights)
-        else:
-            # Use adaptive weights if no weights are provided
-            self.criterion = FeatureWeightedMSELoss(num_features, adaptive=True)
+        # Always use adaptive weights
+        self.criterion = FeatureWeightedMSELoss(
+            num_features=num_features,
+            error_history_size=25,
+            stability_factor=0.5
+        )
         
         # Store the latest attention weights
         self.last_time_attention = None
         self.last_feature_attention = None
-        
+
     def train(self, epoch, lr, data2learn):
         num_epochs = epoch
         learning_rate = lr
 
-        # Use the weighted MSE loss instead of standard MSE
         optimizer = torch.optim.Adam(self.predictor.parameters(), lr=learning_rate)
         
         # Slide data
@@ -240,6 +239,10 @@ class MultivariateNormalDataPredictor():
             reshaped_input = train_tensorX.view(batch_size, self.lookback_len, self.num_features)
             loss = self.criterion(outputs, reshaped_input)
             
+            # Update weights based on current errors
+            squared_diff = (outputs - reshaped_input) ** 2
+            self.criterion.update_weights(squared_diff.detach())
+            
             loss.backward()
             optimizer.step()
             
@@ -264,23 +267,25 @@ class MultivariateNormalDataPredictor():
         optimizer = torch.optim.Adam(self.predictor.parameters(), lr=learning_rate)
         
         self.predictor.train()
+        
+        # Calculate squared differences once, outside the epoch loop
+        outputs, time_attn, feature_attn = self.predictor(past_observations.float())
+        batch_size = past_observations.size(0)
+        reshaped_input = past_observations.view(batch_size, self.lookback_len, self.num_features)
+        squared_diff = (outputs - reshaped_input) ** 2
+        
+        # Update weights only once per timestep
+        self.criterion.update_weights(squared_diff.detach())
+        
+        # Then do the training loop
         for epoch in range(num_epochs):
             optimizer.zero_grad()
             
-            # Forward pass - now unpack the tuple correctly
             outputs, time_attn, feature_attn = self.predictor(past_observations.float())
-            
-            # Store the latest attention weights
             self.last_time_attention = time_attn
             self.last_feature_attention = feature_attn
             
-            # The autoencoder outputs [batch_size, lookback_len, num_features]
-            batch_size = past_observations.size(0)
-            reshaped_input = past_observations.view(batch_size, self.lookback_len, self.num_features)
-            
-            # Calculate loss using weighted MSE - pass only the output tensor
             loss = self.criterion(outputs, reshaped_input)
-            
             loss.backward()
             optimizer.step()
 
@@ -302,94 +307,61 @@ class MultivariateNormalDataPredictor():
         return None
 
 class FeatureWeightedMSELoss(nn.Module):
-    def __init__(self, num_features, initial_weights=None, adaptive=True):
-        """
-        Custom MSE loss that weights each feature's contribution to balance their impact.
-        
-        Args:
-            num_features: Number of features in the input data
-            initial_weights: Initial weights for each feature (optional)
-            adaptive: Whether to adaptively update weights based on error magnitudes
-        """
+    def __init__(self, num_features, error_history_size=25, stability_factor=0.5):
         super(FeatureWeightedMSELoss, self).__init__()
-        
-        # Initialize weights
-        if initial_weights is not None:
-            self.feature_weights = torch.tensor(initial_weights, dtype=torch.float32)
-        else:
-            # Start with equal weights
-            self.feature_weights = torch.ones(num_features, dtype=torch.float32)
-            
-        self.adaptive = adaptive
+        self.feature_weights = torch.ones(num_features, dtype=torch.float32) / num_features
+        self.error_history_size = error_history_size
         self.error_history = []
-        self.alpha = 0.1  # Weight adaptation rate
-        
-    def update_weights(self, errors):
-        """Update weights based on the inverse of error magnitudes"""
-
-        mean_errors = torch.mean(errors, dim=[0, 1])
-        
-        # Ensure mean_errors has the right shape [num_features]
-        if mean_errors.shape[0] != len(self.feature_weights):
-            print(f"Warning: Error shape mismatch. Expected {len(self.feature_weights)} features, got {mean_errors.shape[0]}")
-            return
-        
-        # Store in history for smoothing
-        self.error_history.append(mean_errors.detach())
-        if len(self.error_history) > 10: 
-            self.error_history.pop(0)
-        
-        # Make sure all tensors in error_history have the same shape
-        if not all(e.shape == self.error_history[0].shape for e in self.error_history):
-            print("Warning: Inconsistent error shapes in history. Resetting history.")
-            self.error_history = [self.error_history[-1]]
-        
-        # Average errors over history
-        avg_errors = torch.mean(torch.stack(self.error_history), dim=0)
-        
-        # Calculate weights as inverse of error magnitude (with smoothing)
-        # Add small epsilon to prevent division by zero
-        epsilon = 1e-8
-        error_sum = torch.sum(avg_errors) + epsilon * len(avg_errors)
-        
-        # Each weight is proportional to (total_error / feature_error)
-        # This gives higher weight to features with smaller errors
-        new_weights = error_sum / (avg_errors + epsilon)
-        
-        # Normalize weights to sum to num_features (to maintain scale)
-        new_weights = new_weights * (len(new_weights) / torch.sum(new_weights))
-        
-        # Gradually update weights
-        self.feature_weights = (1 - self.alpha) * self.feature_weights + self.alpha * new_weights
         
     def forward(self, y_pred, y_true):
-        # Calculate squared error for each element
-        if len(y_pred.shape) == 3:  # For shape [batch_size, seq_len, num_features]
-            # Mean over batch and sequence dimensions
+        if len(y_pred.shape) == 3:
             squared_diff = (y_pred - y_true) ** 2
-            feature_errors = torch.mean(squared_diff, dim=[0, 1])  # Average across batch and seq
+            feature_errors = torch.mean(squared_diff, dim=[0, 1])
             
-            # Apply weights to each feature's error
             weights = self.feature_weights.to(y_pred.device)
             weighted_errors = feature_errors * weights
             
-            # Update weights if adaptive
-            if self.adaptive and self.training:
-                self.update_weights(squared_diff)
-                
-            # Return mean over all features
             return torch.mean(weighted_errors)
         else:
-            # For flattened inputs, reshape based on feature count
             batch_size = y_pred.size(0)
             seq_len = y_true.size(1) if len(y_true.shape) > 2 else 1
             num_features = len(self.feature_weights)
             
-            # Reshape to [batch_size, seq_len, num_features] if needed
             y_pred_reshaped = y_pred.view(batch_size, seq_len, num_features)
             y_true_reshaped = y_true.view(batch_size, seq_len, num_features)
             
             return self.forward(y_pred_reshaped, y_true_reshaped)
+            
+    def update_weights(self, errors):
+        mean_errors = torch.mean(errors, dim=[0, 1])
+        print(f"Current errors: {mean_errors}")
+        
+        # Store in history for smoothing
+        self.error_history.append(mean_errors.detach())
+        if len(self.error_history) > self.error_history_size:
+            self.error_history.pop(0)
+            
+        if len(self.error_history) < self.error_history_size:
+            return
+            
+        # Calculate average errors over the history window
+        error_history_tensor = torch.stack(self.error_history)
+        avg_errors = torch.mean(error_history_tensor, dim=0)
+        print(f"Average errors: {avg_errors}")
+        
+        # Instead of using ratios, compare errors to their mean
+        mean_error = torch.mean(avg_errors)
+        error_scores = mean_error / (avg_errors + 1e-8)
+        print(f"Error scores relative to mean: {error_scores}")
+        
+        # Normalize scores directly without softmax
+        weights = error_scores / torch.sum(error_scores)
+        
+        # Apply softer bounds (0.1 to 0.7)
+        weights = 0.6 * weights + 0.1
+        
+        print(f"New weights: {weights}")
+        self.feature_weights = weights
 
 class AttentionLSTMAutoencoder(nn.Module):
     def __init__(self, num_features, bottleneck_size, num_layers, lookback_len):
@@ -398,8 +370,8 @@ class AttentionLSTMAutoencoder(nn.Module):
         self.bottleneck_size = bottleneck_size
         self.num_layers = num_layers
         self.lookback_len = lookback_len
-        self.hidden_size = 100  # Can be adjusted based on complexity needed
-        
+        self.hidden_size = 100
+
         # Encoder
         self.encoder = nn.LSTM(
             input_size=num_features,
@@ -442,70 +414,55 @@ class AttentionLSTMAutoencoder(nn.Module):
         # Output projection
         self.output_layer = nn.Linear(self.hidden_size, num_features)
         
-        # Add feature image processing
+        # Update feature image processing layers
         self.feature_image_processor = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),  # Process 3x3 feature images
             nn.ReLU(),
             nn.MaxPool2d(2),
             nn.Conv2d(16, 32, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1))
+            nn.AdaptiveAvgPool2d((1, 1))  # Output shape: [batch_size, 32, 1, 1]
         )
         
-        # Add correlation attention network
+        # Update correlation attention network
         self.correlation_attention = nn.Sequential(
-            nn.Linear(num_features + 32, 64),  # 32 comes from feature_image_processor output
+            nn.Linear(num_features + 32, 64),  # Combine original features + CNN-processed correlations
             nn.Tanh(),
             nn.Linear(64, num_features)
         )
 
     def build_feature_image(self, x):
-        # x shape: [batch_size, lookback_len, num_features]
+        """
+        Implements vectorized computation of pairwise inner products across features.
+        """
         batch_size, seq_len, num_features = x.shape
         
-        # Initialize feature image matrix
-        feature_images = torch.zeros(batch_size, num_features, num_features, device=x.device)
+        # Vectorized computation using matrix multiplication
+        x_transposed = x.transpose(1, 2)  # [batch_size, num_features, lookback_len]
+        feature_images = torch.matmul(x, x_transposed) / seq_len  # [batch_size, num_features, num_features]
         
-        # Calculate pairwise inner products
-        for i in range(num_features):
-            for j in range(num_features):
-                # Calculate inner product across time steps
-                inner_product = torch.sum(x[:, :, i] * x[:, :, j], dim=1)
-                feature_images[:, i, j] = inner_product
-        
-        # Add batch dimension and channel dimension for CNN processing
-        feature_images = feature_images.unsqueeze(1)  # [batch_size, 1, num_features, num_features]
-        return feature_images
+        return feature_images.unsqueeze(1)  # Add channel dim: [batch_size, 1, num_features, num_features]
 
     def apply_feature_attention(self, x):
         # x shape: [batch_size, lookback_len, num_features]
-        batch_size, seq_len, num_features = x.shape
+        batch_size = x.size(0)
         
-        # Build feature image
-        feature_image = self.build_feature_image(x)
+        # 1. Build feature image using vectorized computation
+        feature_image = self.build_feature_image(x)  # [batch_size, 1, num_features, num_features]
         
-        # Process feature image through CNN
-        processed_features = self.feature_image_processor(feature_image)
-        processed_features = processed_features.view(batch_size, -1)
+        # 2. Process through CNN
+        processed_correlations = self.feature_image_processor(feature_image)  # [batch_size, 32, 1, 1]
+        processed_correlations = processed_correlations.view(batch_size, -1)  # [batch_size, 32]
         
-        # Calculate feature attention scores
-        flat_x = x.reshape(-1, self.num_features)
-        attn_scores = self.feature_attention(flat_x)
+        # 3. Combine with original features
+        expanded_correlations = processed_correlations.unsqueeze(1).expand(-1, self.lookback_len, -1)
+        combined = torch.cat([x, expanded_correlations], dim=2)  # [batch_size, lookback_len, num_features+32]
         
-        # Reshape attention scores to match processed features
-        attn_scores = attn_scores.view(batch_size, seq_len, num_features)
+        # 4. Compute correlation-aware attention weights
+        attn_scores = self.correlation_attention(combined)  # [batch_size, lookback_len, num_features]
+        feature_weights = F.softmax(attn_scores, dim=2)
         
-        # Expand processed features to match attention scores
-        processed_features = processed_features.unsqueeze(1).expand(-1, seq_len, -1)
-        
-        # Combine with feature image information
-        combined_features = torch.cat([attn_scores, processed_features], dim=-1)
-        
-        # Apply attention
-        attention_weights = self.correlation_attention(combined_features)
-        feature_weights = F.softmax(attention_weights, dim=2)
-        
-        # Apply feature weights
+        # 5. Apply weights to original features
         weighted_x = x * feature_weights
         
         return weighted_x, feature_weights

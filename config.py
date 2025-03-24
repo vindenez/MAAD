@@ -20,9 +20,9 @@ value_range_config = {
 }
 
 weight_config = {
-    "conductivity_conductivity": 1/6,
-    "pressure_pressure": 1/6,
-    "pressure_temperature": 4/6
+    "conductivity_conductivity": 1/10,
+    "pressure_pressure": 3/10,
+    "pressure_temperature": 6/10
 }
 
 # Extract the uncommented columns
@@ -35,7 +35,7 @@ LSTM_size_layer = 3         # Number of LSTM layers for Encoder and Decoder
 bottleneck_size = 10
 
 # Training parameters
-epoch_train = 2000           # Epochs for initial training
+epoch_train = 100           # Epochs for initial training
 lr_train = 0.001           # Learning rate for initial training
 
 # Update MultivariateNormalDataPredictor parameters
