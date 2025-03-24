@@ -3,7 +3,7 @@ import pandas as pd
 import os
 
 # Data source path
-data_source_path = "data/Austevoll_Autumn_2023_no_dcps.csv"
+data_source_path = "data/Austevoll_Autumn_2023_no_dcps_small.csv"
 
 # Data source configuration
 data_source = "LSTM-AE" 
@@ -20,9 +20,9 @@ value_range_config = {
 }
 
 weight_config = {
-    "conductivity_conductivity": 1/4,
-    "pressure_pressure": 1/4,
-    "pressure_temperature": 2/4
+    "conductivity_conductivity": 1/16,
+    "pressure_pressure": 5/16,
+    "pressure_temperature": 5/8
 }
 
 # Extract the uncommented columns
@@ -40,9 +40,9 @@ lr_train = 0.0005           # Learning rate for initial training
 epoch_update = 50           # Epochs for online updates
 lr_update = 0.001           # Learning rate for online updates
 
-# Update AnomalousThresholdGenerator parameters
+# Update AnomalousThresholdGenerator parameters 
 update_G_epoch = 50         # Epochs for threshold generator updates
-update_G_lr = 0.0005        # Learning rate for threshold generator updates
+update_G_lr = 0.001        # Learning rate for threshold generator updates
 
 log_dir = f"results/{data_source}"
 
@@ -59,6 +59,6 @@ def init_config():
                                      predictor_config['prediction_len'] 
     
     # Minimal threshold for anomaly detection
-    minimal_threshold = 0.002
+    minimal_threshold = 0.0025
     
     return predictor_config, value_range_config, minimal_threshold
