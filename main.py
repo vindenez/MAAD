@@ -21,7 +21,14 @@ value_range_db = NormalValueRangeDb()
 class AdapAD:
     def __init__(self, predictor_config, minimal_threshold):
         self.predictor_config = predictor_config
-        self.minimal_threshold = minimal_threshold
+        # Instead of a single minimal threshold, create a list of minimal thresholds
+        self.minimal_thresholds = []
+        for feature in feature_columns:
+            # Get parameter-specific minimal threshold from config, or use default if not specified
+            self.minimal_thresholds.append(
+                config.parameter_config.get(feature, {}).get('minimal_threshold', minimal_threshold)
+            )
+        
         self.num_features = len(feature_columns)
         
         self.sensor_range = NormalValueRangeDb()
@@ -34,19 +41,22 @@ class AdapAD:
             num_features=self.num_features
         )
         
-        self.generator = LSTMPredictor(
-            self.predictor_config['prediction_len'], 
-            self.predictor_config['lookback_len'], 
-            config.LSTM_size, 
-            config.LSTM_size_layer, 
-            self.predictor_config['lookback_len']
-        ) 
+        self.generator = MultivariateTresholdGenerator(
+            lstm_layer=config.LSTM_size_layer,
+            lstm_unit=config.LSTM_size,
+            lookback_len=self.predictor_config['lookback_len'],
+            prediction_len=self.predictor_config['prediction_len'],
+            num_features=self.num_features
+        )
         
         self.predicted_vals = PredictedNormalDataDb()
-        self.thresholds = AnomalousThresholdDb()
-        self.thresholds.append(self.minimal_threshold)
-        self.anomalies = []
+        # Initialize thresholds list with the correct number of features
+        self.thresholds = [AnomalousThresholdDb() for _ in range(self.num_features)]
+        # Initialize each threshold database with its specific minimal_threshold
+        for i, thresh_db in enumerate(self.thresholds):
+            thresh_db.append(self.minimal_thresholds[i])
         
+        self.anomalies = []
         self.predictive_errors = None
 
     def set_training_data(self, training_data):
@@ -81,9 +91,9 @@ class AdapAD:
             pred_np = train_predicted_val[0, -1, :] if isinstance(train_predicted_val, np.ndarray) else train_predicted_val[0, -1, :].detach().numpy()
             target_np = trainY_np[i, -1, :]
             
-            # Use MSE instead of MAE
-            error = np.mean((pred_np - target_np) ** 2)
-            errors.append(error)
+            # Calculate per-feature errors
+            errors_per_feature = (pred_np - target_np) ** 2
+            errors.append(errors_per_feature)
         
         self.predictive_errors = PredictionErrorDb(errors)
         original_errors = self.predictive_errors.get_tail(self.predictive_errors.get_length())
@@ -104,7 +114,7 @@ class AdapAD:
                 optimizer.zero_grad()
                 
                 _x, _y = x[i], y[i]
-                outputs = self.generator(torch.Tensor(_x).reshape((1,-1)))
+                outputs = self.generator.model(torch.Tensor(_x).reshape((1,-1)))
                 loss = criterion(outputs, torch.Tensor(_y).reshape((1,-1)))
                 loss.backward(retain_graph=True)
                 optimizer.step()
@@ -170,8 +180,11 @@ class AdapAD:
                     np.array(current_observation)
                 )
                 
-                # Get the current threshold (if available)
-                threshold = self.thresholds.get_tail(1) if self.thresholds.get_length() > 0 else self.minimal_threshold
+                # Get the current thresholds (if available)
+                thresholds = [
+                    thresh_db.get_tail(1) if thresh_db.get_length() > 0 else self.minimal_thresholds[i] 
+                    for i, thresh_db in enumerate(self.thresholds)
+                ]
                 
                 if not hasattr(self, 'feature_log_files'):
                     self.feature_log_files = []
@@ -198,6 +211,8 @@ class AdapAD:
                             
                             # Calculate current error
                             current_error = self.current_errors[i]
+                            # Use feature-specific threshold
+                            threshold = thresholds[i]
                             # Determine if this individual error exceeds threshold
                             is_anomalous = current_error > threshold
                             
@@ -221,8 +236,11 @@ class AdapAD:
                         header = "idx,is_anomalous,error,threshold\n"
                         f.write(header)
                 
-                # Log overall system metrics
-                text2write = f"{current_idx},{reconstruction_error > threshold},{reconstruction_error:.6f},{threshold:.6f}\n"
+                # Log overall system metrics - use max error and corresponding threshold
+                max_error_idx = np.argmax(self.current_errors)
+                max_error = self.current_errors[max_error_idx]
+                corresponding_threshold = thresholds[max_error_idx]
+                text2write = f"{current_idx},{max_error > corresponding_threshold},{max_error:.6f},{corresponding_threshold:.6f}\n"
                 with open(self.main_log_file, 'a') as f:
                     f.write(text2write)
                 
@@ -259,40 +277,47 @@ class AdapAD:
         # Get prediction before adding current value
         predicted_val = self.data_predictor.predict(past_observations_tensor)
         
-        # Calculate MSE reconstruction error
+        # Calculate MSE reconstruction error for current timestep
         reconstruction_error = self.calculate_reconstruction_error(predicted_val, normalized_val)
         
+        # Initialize thresholds with minimal values
+        thresholds = np.array(self.minimal_thresholds)
+        
+        # Generate thresholds only if there are enough historical errors
+        if self.predictive_errors and self.predictive_errors.get_length() >= self.predictor_config['lookback_len'] + 1:
+            self.generator.eval()
+            # Get errors from t-4 to t-2 (excluding t-1 and t)
+            past_predictive_errors = self.predictive_errors.get_tail(self.predictor_config['lookback_len'] + 1)[:-1]
+            
+            # Store this for later use in update
+            self.past_errors_tensor = torch.from_numpy(np.array(past_predictive_errors).reshape(1, -1)).float()
+            
+            with torch.no_grad():
+                thresholds = self.generator.model(self.past_errors_tensor)
+                thresholds = thresholds.data.numpy()
+                thresholds = thresholds.flatten()[:self.num_features]
+                thresholds = np.maximum(thresholds, self.minimal_thresholds)
+                thresholds = np.minimum(thresholds, 0.2)
+
         # Now add the current value and prediction to our history
         self.observed_vals.append(normalized_val)
         supposed_anomalous_pos = self.observed_vals.get_length()
         self.predicted_vals.append(predicted_val)
         
-        # Store the error
+        # Store the current error
         self.predictive_errors.append(reconstruction_error)
         
-        # Generate threshold only if there are enough historical errors
-        if self.predictive_errors.get_length() >= self.predictor_config['lookback_len']:
-            self.generator.eval()
-            past_predictive_errors = self.predictive_errors.get_tail(self.predictor_config['lookback_len'])
-            
-            past_errors_tensor = torch.from_numpy(np.array(past_predictive_errors).reshape(1, -1)).float()
-            
-            with torch.no_grad():
-                threshold = self.generator(past_errors_tensor)
-                threshold = threshold.data.numpy()
-                # Cap the threshold to avoid extreme values
-                threshold = min(0.2, max(threshold[0, 0], self.minimal_threshold))
-
-            self.thresholds.append(threshold)
-        else:
-            threshold = self.minimal_threshold
+        # Store thresholds for each feature
+        for i in range(self.num_features):
+            self.thresholds[i].append(thresholds[i])
 
         if not all(self.is_inside_range(val, i) for i, val in enumerate(normalized_val)):
             self.anomalies.append(supposed_anomalous_pos)
             is_anomalous_ret = True
         else:
-            # Check if error exceeds threshold
-            if reconstruction_error > threshold:
+            # Check if any error exceeds its corresponding threshold
+            errors_exceed_thresholds = np.any(self.current_errors > thresholds)
+            if errors_exceed_thresholds:
                 is_anomalous_ret = True
                 self.anomalies.append(supposed_anomalous_pos)
             
@@ -305,13 +330,14 @@ class AdapAD:
             )
             
             # Update generator if needed
-            if is_anomalous_ret or threshold > self.minimal_threshold:
-                self.__update_generator(past_errors_tensor, reconstruction_error)
+            if is_anomalous_ret or np.any(thresholds > self.minimal_thresholds):
+                # Use stored past_errors_tensor
+                self.__update_generator(self.current_errors)
         
         self.__logging(is_anomalous_ret)
         return is_anomalous_ret
 
-    def __update_generator(self, past_predictive_errors, prediction_error):
+    def __update_generator(self, prediction_errors):
         self.generator.train()
         
         criterion = torch.nn.MSELoss()    
@@ -319,10 +345,11 @@ class AdapAD:
         
         loss_l = list()
         for epoch in range(config.update_G_epoch):
-            predicted_val = self.generator(past_predictive_errors.float())
+            predicted_val = self.generator.model(self.past_errors_tensor)
             optimizer.zero_grad()
             
-            target = torch.tensor([[prediction_error]], dtype=torch.float32)
+            # Reshape prediction_errors to match the output shape
+            target = torch.tensor(prediction_errors.reshape(1, -1), dtype=torch.float32)
             
             loss = criterion(predicted_val, target)
             loss.backward(retain_graph=True)
@@ -336,7 +363,8 @@ class AdapAD:
     def clean(self):
         self.predicted_vals.clean(self.predictor_config['lookback_len'])
         self.predictive_errors.clean(self.predictor_config['lookback_len'])
-        self.thresholds.clean(self.predictor_config['lookback_len'])
+        for thresh_db in self.thresholds:
+            thresh_db.clean(self.predictor_config['lookback_len'])
         
     def close_logs(self):
         pass
@@ -386,6 +414,18 @@ if __name__ == "__main__":
     
     # AdapAD
     AdapAD_obj = AdapAD(predictor_config, minimal_threshold)
+
+    # Print configuration for each parameter
+    print("\nParameter Configurations:")
+    print("-" * 50)
+    for i, feature in enumerate(feature_columns):
+        value_range = value_range_config[feature]
+        min_threshold = AdapAD_obj.minimal_thresholds[i]
+        print(f"Parameter: {feature}")
+        print(f"  Value Range: {value_range}")
+        print(f"  Minimal Threshold: {min_threshold}")
+        print("-" * 50)
+
     print('GATHERING DATA FOR TRAINING...', predictor_config['train_size'])
     
     observed_data = []

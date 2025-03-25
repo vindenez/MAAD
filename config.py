@@ -9,20 +9,25 @@ data_source_path = "data/Austevoll_Autumn_2023_no_dcps_small.csv"
 data_source = "LSTM-AE" 
 
 # Configuration using column names
-value_range_config = {
-    "conductivity_conductivity": (25.0, 38.0),
-    #"conductivity_temperature": (5.0, 17.0),
-    #"conductivity_salinity": (18.0, 32.0),
-    #"conductivity_density": (1008.0, 1030.0),
-    #"conductivity_soundspeed": (1460.0, 1510.0),
-    "pressure_pressure": (299.0, 321.0),
-    "pressure_temperature": (5.0, 17.0)
+parameter_config = {
+    "conductivity_conductivity": {
+        "value_range": (25.0, 38.0),
+        "minimal_threshold": 0.04
+    },
+    "pressure_pressure": {
+        "value_range": (299.0, 321.0),
+        "minimal_threshold": 0.021
+    },
+    "pressure_temperature": {
+        "value_range": (5.0, 17.0),
+        "minimal_threshold": 0.018 
+    }
 }
 
-weight_config = {
-    "conductivity_conductivity": 0.15,
-    "pressure_pressure": 0.04,
-    "pressure_temperature": 2.5
+# Extract value ranges for easier access
+value_range_config = {
+    key: value["value_range"] 
+    for key, value in parameter_config.items()
 }
 
 # Extract the uncommented columns
@@ -33,15 +38,15 @@ LSTM_size = 100             # Hidden units in LSTM
 LSTM_size_layer = 3         # Number of LSTM layers for Encoder and Decoder
 
 # Training parameters
-epoch_train = 100           # Epochs for initial training
+epoch_train = 1000           # Epochs for initial training
 lr_train = 0.0005           # Learning rate for initial training
 
 # Update MultivariateNormalDataPredictor parameters
-epoch_update = 50           # Epochs for online updates
+epoch_update = 100           # Epochs for online updates
 lr_update = 0.001           # Learning rate for online updates
 
 # Update AnomalousThresholdGenerator parameters 
-update_G_epoch = 50         # Epochs for threshold generator updates
+update_G_epoch = 100         # Epochs for threshold generator updates
 update_G_lr = 0.001        # Learning rate for threshold generator updates
 
 log_dir = f"results/{data_source}"

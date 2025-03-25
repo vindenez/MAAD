@@ -250,3 +250,67 @@ class MultivariateNormalDataPredictor():
             loss = criterion(predicted_val, reshaped_input)
             loss.backward()
             optimizer.step()
+
+class MultivariateLSTMPredictor(nn.Module):
+    def __init__(self, num_features, input_size, hidden_size, num_layers, lookback_len):
+        super(MultivariateLSTMPredictor, self).__init__()
+        
+        self.num_features = num_features
+        self.num_layers = num_layers
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.seq_length = lookback_len
+
+        self.lstm = nn.LSTM(input_size=input_size, 
+                           hidden_size=hidden_size,
+                           num_layers=num_layers, 
+                           batch_first=True)
+        
+        # Output layer produces threshold for each feature
+        self.fc = nn.Linear(in_features=hidden_size, 
+                           out_features=num_features)
+
+    def forward(self, x):     
+        x, (h_out, _) = self.lstm(x)
+        h_out = h_out.view(-1, self.hidden_size)   
+        # Generate threshold for each feature
+        thresholds = self.fc(h_out)
+        return thresholds
+
+class MultivariateTresholdGenerator():
+    def __init__(self, lstm_layer, lstm_unit, lookback_len, prediction_len, num_features):
+        hidden_size = lstm_unit
+        num_layers = lstm_layer
+        self.lookback_len = lookback_len
+        self.prediction_len = prediction_len
+        self.num_features = num_features
+        
+        # Rename this to model to be more explicit
+        self.model = MultivariateLSTMPredictor(
+            num_features=num_features,
+            input_size=lookback_len,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            lookback_len=lookback_len
+        )
+
+    def parameters(self):
+        # Add this method to expose the model's parameters
+        return self.model.parameters()
+
+    def train(self):
+        # Set model to training mode
+        self.model.train()
+
+    def eval(self):
+        # Set model to evaluation mode
+        self.model.eval()
+
+    def generate(self, prediction_errors, minimal_threshold):
+        self.model.eval()
+        with torch.no_grad():
+            thresholds = self.model(prediction_errors)
+            thresholds = thresholds.data.numpy()
+            # Apply minimal threshold to all features
+            thresholds = np.maximum(minimal_threshold, thresholds)
+        return thresholds
