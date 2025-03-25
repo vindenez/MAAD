@@ -48,7 +48,6 @@ class AdapAD:
         self.anomalies = []
         
         self.predictive_errors = None
-        
 
     def set_training_data(self, training_data):
         # Normalize the training data
@@ -71,19 +70,25 @@ class AdapAD:
             self.training_data
         )
         
+        # Calculate initial errors using MSE
         predicted_values = []
+        errors = []
+        
+        trainY_np = trainY.detach().numpy() if torch.is_tensor(trainY) else trainY
+        
         for i in range(len(trainX)):
             train_predicted_val = self.data_predictor.predict(torch.reshape(trainX[i], (1, -1)))
-            predicted_values.append(train_predicted_val[0])  
+            pred_np = train_predicted_val[0, -1, :] if isinstance(train_predicted_val, np.ndarray) else train_predicted_val[0, -1, :].detach().numpy()
+            target_np = trainY_np[i, -1, :]
+            
+            # Use MSE instead of MAE
+            error = np.mean((pred_np - target_np) ** 2)
+            errors.append(error)
         
-        trainY = trainY.data.numpy()
-        predicted_values = np.array(predicted_values)
-        
-        errors = np.mean((trainY - predicted_values)**2, axis=1)
-        
-        self.predictive_errors = PredictionErrorDb(errors.tolist())
+        self.predictive_errors = PredictionErrorDb(errors)
         original_errors = self.predictive_errors.get_tail(self.predictive_errors.get_length())
         
+        # Train generator with MSE errors
         criterion = torch.nn.MSELoss()    
         optimizer = torch.optim.Adam(self.generator.parameters(), lr=config.lr_train)
         
@@ -117,7 +122,7 @@ class AdapAD:
         feature = feature_columns[feature_idx]
         min_val, max_val = value_range_config[feature]
         return normalized_val * (max_val - min_val) + min_val
-
+    
     def calculate_reconstruction_error(self, predicted, observed):
         if isinstance(predicted, np.ndarray) and len(predicted.shape) == 3:
             predicted_for_comparison = predicted[0, -1, :]
@@ -125,14 +130,20 @@ class AdapAD:
             predicted_for_comparison = predicted
         
         observed_np = np.array(observed)
+        # Simple MSE calculation
+        errors = predicted_for_comparison - observed_np
+        reconstruction_error = np.mean(errors ** 2)
         
-        # Calculate squared differences for each feature
-        squared_diffs = (predicted_for_comparison - observed_np) ** 2
+        # Store raw error for logging
+        self.current_errors = np.abs(errors)
         
-        # Calculate MSE
-        mse = np.mean(squared_diffs)
-        
-        return mse
+        return reconstruction_error
+
+    def get_feature_weights(self):
+        """Helper method to monitor how weights are being assigned to features"""
+        if hasattr(self, 'current_weights'):
+            return dict(zip(feature_columns, self.current_weights))
+        return None
 
     def __logging(self, is_anomalous_ret):
         try:
@@ -171,7 +182,6 @@ class AdapAD:
                     for i in range(len(feature_names)):
                         feature_name = feature_names[i]
                         log_file_path = f"{config.log_dir}/{feature_name}_experiment_log.csv"
-                        # Create header
                         with open(log_file_path, 'w') as f:
                             header = "idx,observed,predicted,lower_bound,upper_bound,is_anomalous,error,threshold\n"
                             f.write(header)
@@ -181,29 +191,28 @@ class AdapAD:
                 for i in range(len(self.feature_log_files)):
                     predicted_for_logging = predicted[0, -1, :] if len(predicted.shape) == 3 else predicted
                     if i < len(current_observation) and i < len(predicted_for_logging):
-                        # Open log file for appending
                         with open(self.feature_log_files[i], 'a') as f:
                             # Get normalized values
                             observed_val_norm = current_observation[i]
                             predicted_val_norm = predicted_for_logging[i]
                             
-                            # Denormalize values
+                            # Calculate current error
+                            current_error = self.current_errors[i]
+                            # Determine if this individual error exceeds threshold
+                            is_anomalous = current_error > threshold
+                            
+                            # Calculate bounds in normalized space
+                            lower_bound_norm = max(0, predicted_val_norm - threshold)
+                            upper_bound_norm = min(1, predicted_val_norm + threshold)
+                            
+                            # Denormalize all values
                             observed_val = self.__reverse_normalized_data(observed_val_norm, i)
                             predicted_val = self.__reverse_normalized_data(predicted_val_norm, i)
+                            lower_bound = self.__reverse_normalized_data(lower_bound_norm, i)
+                            upper_bound = self.__reverse_normalized_data(upper_bound_norm, i)
                             
-                            # Calculate denormalized bounds
-                            feature = feature_columns[i]
-                            min_val, max_val = value_range_config[feature]
-                            
-                            # Convert threshold to denormalized scale for this feature
-                            denorm_threshold = threshold * (max_val - min_val)
-                            
-                            # Calculate bounds in denormalized space
-                            lower_bound = max(min_val, predicted_val - denorm_threshold)
-                            upper_bound = min(max_val, predicted_val + denorm_threshold)
-                            
-                            # Create log entry
-                            text2write = f"{current_idx},{observed_val},{predicted_val},{lower_bound},{upper_bound},{reconstruction_error > threshold},{reconstruction_error},{threshold}\n"
+                            text2write = f"{current_idx},{observed_val},{predicted_val},{lower_bound},{upper_bound},"
+                            text2write += f"{is_anomalous},{current_error:.6f},{threshold:.6f}\n"
                             f.write(text2write)
                 
                 if not hasattr(self, 'main_log_file'):
@@ -213,17 +222,14 @@ class AdapAD:
                         f.write(header)
                 
                 # Log overall system metrics
+                text2write = f"{current_idx},{reconstruction_error > threshold},{reconstruction_error:.6f},{threshold:.6f}\n"
                 with open(self.main_log_file, 'a') as f:
-                    text2write = f"{current_idx},{reconstruction_error > threshold},{reconstruction_error},{threshold}\n"
                     f.write(text2write)
-                
                 
         except Exception as e:
             import traceback
             traceback.print_exc()
             print(f"Error in logging: {e}")
-            print(f"current_observation: {current_observation}")
-            print(f"predicted shape: {predicted.shape if hasattr(predicted, 'shape') else 'not a numpy array'}")
 
     def is_anomalous(self, observed_val):
         is_anomalous_ret = False
@@ -239,55 +245,68 @@ class AdapAD:
             
         # Normalize data
         normalized_val = self.__normalize_data(observed_val)
-        self.observed_vals.append(normalized_val)
-        supposed_anomalous_pos = self.observed_vals.get_length()
         
-        # Prepare data for prediction
+        # Get past observations BEFORE adding current value
         past_observations = self.observed_vals.get_tail(self.predictor_config['lookback_len'])
         if len(past_observations) < self.predictor_config['lookback_len']:
+            self.observed_vals.append(normalized_val)  # Add current value after checking
             return False  
             
+        # Make prediction using only past data
         past_observations = np.array(past_observations)
         past_observations_tensor = torch.Tensor(past_observations.reshape(1, -1))
         
+        # Get prediction before adding current value
         predicted_val = self.data_predictor.predict(past_observations_tensor)
+        
+        # Calculate MSE reconstruction error
+        reconstruction_error = self.calculate_reconstruction_error(predicted_val, normalized_val)
+        
+        # Now add the current value and prediction to our history
+        self.observed_vals.append(normalized_val)
+        supposed_anomalous_pos = self.observed_vals.get_length()
         self.predicted_vals.append(predicted_val)
         
-        if not all(self.is_inside_range(x, i) for i, x in enumerate(normalized_val)):
+        # Store the error
+        self.predictive_errors.append(reconstruction_error)
+        
+        # Generate threshold only if there are enough historical errors
+        if self.predictive_errors.get_length() >= self.predictor_config['lookback_len']:
+            self.generator.eval()
+            past_predictive_errors = self.predictive_errors.get_tail(self.predictor_config['lookback_len'])
+            
+            past_errors_tensor = torch.from_numpy(np.array(past_predictive_errors).reshape(1, -1)).float()
+            
+            with torch.no_grad():
+                threshold = self.generator(past_errors_tensor)
+                threshold = threshold.data.numpy()
+                # Cap the threshold to avoid extreme values
+                threshold = min(0.2, max(threshold[0, 0], self.minimal_threshold))
+
+            self.thresholds.append(threshold)
+        else:
+            threshold = self.minimal_threshold
+
+        if not all(self.is_inside_range(val, i) for i, val in enumerate(normalized_val)):
             self.anomalies.append(supposed_anomalous_pos)
             is_anomalous_ret = True
         else:
-            reconstruction_error = self.calculate_reconstruction_error(predicted_val, normalized_val)
-            self.predictive_errors.append(reconstruction_error)
+            # Check if error exceeds threshold
+            if reconstruction_error > threshold:
+                is_anomalous_ret = True
+                self.anomalies.append(supposed_anomalous_pos)
             
-            # generate threshold only if there are enough historical errors
-            if self.predictive_errors.get_length() >= self.predictor_config['lookback_len']:
-                self.generator.eval()
-                past_predictive_errors = self.predictive_errors.get_tail(self.predictor_config['lookback_len'])
-                
-                past_errors_tensor = torch.from_numpy(np.array(past_predictive_errors).reshape(1, -1)).float()
-                
-                with torch.no_grad():
-                    threshold = self.generator(past_errors_tensor)
-                    threshold = threshold.data.numpy()
-                    threshold = max(threshold[0, 0], self.minimal_threshold)
-                
-                self.thresholds.append(threshold)
-                
-                # Check if error exceeds threshold
-                if reconstruction_error > threshold:
-                    is_anomalous_ret = True
-                    self.anomalies.append(supposed_anomalous_pos)
-                
-                self.data_predictor.update(
-                    config.epoch_update,
-                    config.lr_update,
-                    past_observations_tensor,
-                    normalized_val
-                )
-                
-                if is_anomalous_ret or threshold > self.minimal_threshold:
-                    self.__update_generator(past_errors_tensor, reconstruction_error)
+            # Update predictor
+            self.data_predictor.update(
+                config.epoch_update,
+                config.lr_update,
+                past_observations_tensor,
+                normalized_val
+            )
+            
+            # Update generator if needed
+            if is_anomalous_ret or threshold > self.minimal_threshold:
+                self.__update_generator(past_errors_tensor, reconstruction_error)
         
         self.__logging(is_anomalous_ret)
         return is_anomalous_ret
@@ -320,8 +339,7 @@ class AdapAD:
         self.thresholds.clean(self.predictor_config['lookback_len'])
         
     def close_logs(self):
-        for log_file in self.log_files.values():
-            log_file.close()
+        pass
 
     def is_inside_range(self, val, feature_idx=0):
         observed_val = self.__reverse_normalized_data(val, feature_idx)

@@ -20,9 +20,9 @@ value_range_config = {
 }
 
 weight_config = {
-    "conductivity_conductivity": 1/16,
-    "pressure_pressure": 5/16,
-    "pressure_temperature": 5/8
+    "conductivity_conductivity": 0.15,
+    "pressure_pressure": 0.04,
+    "pressure_temperature": 2.5
 }
 
 # Extract the uncommented columns
@@ -33,7 +33,7 @@ LSTM_size = 100             # Hidden units in LSTM
 LSTM_size_layer = 3         # Number of LSTM layers for Encoder and Decoder
 
 # Training parameters
-epoch_train = 500           # Epochs for initial training
+epoch_train = 100           # Epochs for initial training
 lr_train = 0.0005           # Learning rate for initial training
 
 # Update MultivariateNormalDataPredictor parameters
@@ -59,6 +59,6 @@ def init_config():
                                      predictor_config['prediction_len'] 
     
     # Minimal threshold for anomaly detection
-    minimal_threshold = 0.0025
+    minimal_threshold = 0.019
     
     return predictor_config, value_range_config, minimal_threshold

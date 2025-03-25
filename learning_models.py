@@ -97,21 +97,28 @@ class AnomalousThresholdGenerator():
             threshold = max(minimal_threshold, threshold[0,0])
         return threshold
 
-class LSTMAutoencoder(nn.Module):
+class ConvLSTMAutoencoder(nn.Module):
     def __init__(self, num_features, hidden_size, num_layers, lookback_len):
-        super(LSTMAutoencoder, self).__init__()
+        super(ConvLSTMAutoencoder, self).__init__()
         self.num_features = num_features
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.lookback_len = lookback_len
-
+        
+        # Convolutional layers
+        self.conv1 = nn.Conv1d(num_features, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(32, 16, kernel_size=3, padding=1)
+        
         # Encoder
         self.encoder = nn.LSTM(
-            input_size=num_features,  
+            input_size=16,  
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True
         )
+        
+        # Attention mechanism
+        self.attention = nn.MultiheadAttention(hidden_size, num_heads=4)
         
         # Decoder
         self.decoder = nn.LSTM(
@@ -121,23 +128,51 @@ class LSTMAutoencoder(nn.Module):
             batch_first=True
         )
         
-        self.fc = nn.Linear(hidden_size, num_features)
+        # Deconvolutional layers
+        self.deconv1 = nn.ConvTranspose1d(hidden_size, 32, kernel_size=3, padding=1)
+        self.deconv2 = nn.ConvTranspose1d(32, num_features, kernel_size=3, padding=1)
+        
+        self.dropout = nn.Dropout(0.2)
+        self.norm = nn.LayerNorm(hidden_size)
 
     def forward(self, x):
-        # x shape: [batch_size, lookback_len * num_features]
         batch_size = x.size(0)
         
         # Reshape to [batch_size, lookback_len, num_features]
         x = x.view(batch_size, self.lookback_len, self.num_features)
         
-        # Encoding
-        _, (hidden, cell) = self.encoder(x)
+        # Transform for Conv1d [batch_size, num_features, lookback_len]
+        x = x.transpose(1, 2)
+        
+        # Convolutional encoding
+        x = F.relu(self.conv1(x))
+        x = self.dropout(x)
+        x = F.relu(self.conv2(x))
+        
+        # Prepare for LSTM [batch_size, lookback_len, features]
+        x = x.transpose(1, 2)
+        
+        # LSTM encoding
+        enc_output, (hidden, cell) = self.encoder(x)
+        
+        # Apply attention
+        attn_output, _ = self.attention(enc_output, enc_output, enc_output)
+        attn_output = self.norm(attn_output + enc_output)  # Skip connection
         
         # Decoding
-        decoder_input = torch.zeros(batch_size, self.lookback_len, self.hidden_size)
-        decoder_output, _ = self.decoder(decoder_input, (hidden, cell))
+        decoder_output, _ = self.decoder(attn_output, (hidden, cell))
         
-        output = self.fc(decoder_output)
+        # Reshape for deconv [batch_size, channels, length]
+        x = decoder_output.transpose(1, 2)
+        
+        # Deconvolutional decoding
+        x = F.relu(self.deconv1(x))
+        x = self.dropout(x)
+        output = self.deconv2(x)
+        
+        # Final reshape [batch_size, lookback_len, num_features]
+        output = output.transpose(1, 2)
+        
         return output
 
 class MultivariateNormalDataPredictor():
@@ -148,7 +183,7 @@ class MultivariateNormalDataPredictor():
         self.prediction_len = prediction_len
         self.num_features = num_features
         
-        self.predictor = LSTMAutoencoder(
+        self.predictor = ConvLSTMAutoencoder(
             num_features=num_features,
             hidden_size=hidden_size,
             num_layers=num_layers,
