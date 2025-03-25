@@ -97,99 +97,104 @@ class AnomalousThresholdGenerator():
             threshold = max(minimal_threshold, threshold[0,0])
         return threshold
 
-class ConvLSTMAutoencoder(nn.Module):
-    def __init__(self, num_features, hidden_size, num_layers, lookback_len):
-        super(ConvLSTMAutoencoder, self).__init__()
+class LSTMAutoencoder(nn.Module):
+    def __init__(self, num_features, bottleneck_size, lookback_len, hidden_sizes=None):
+        super(LSTMAutoencoder, self).__init__()
         self.num_features = num_features
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
+        self.bottleneck_size = bottleneck_size
         self.lookback_len = lookback_len
         
-        # Convolutional layers
-        self.conv1 = nn.Conv1d(num_features, 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(32, 16, kernel_size=3, padding=1)
+        # Default hidden sizes if not provided
+        if hidden_sizes is None:
+            hidden_sizes = [100, 50]
         
-        # Encoder
-        self.encoder = nn.LSTM(
-            input_size=16,  
-            hidden_size=hidden_size,
-            num_layers=num_layers,
+        self.hidden_size_1 = hidden_sizes[0]
+        self.hidden_size_2 = hidden_sizes[1]
+        
+        # Encoder - gradually reduce dimension
+        self.encoder_lstm1 = nn.LSTM(
+            input_size=num_features,
+            hidden_size=self.hidden_size_1,
+            num_layers=1,
             batch_first=True
         )
         
-        # Attention mechanism
-        self.attention = nn.MultiheadAttention(hidden_size, num_heads=4)
-        
-        # Decoder
-        self.decoder = nn.LSTM(
-            input_size=hidden_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
+        self.encoder_lstm2 = nn.LSTM(
+            input_size=self.hidden_size_1,
+            hidden_size=self.hidden_size_2,
+            num_layers=1,
             batch_first=True
         )
         
-        # Deconvolutional layers
-        self.deconv1 = nn.ConvTranspose1d(hidden_size, 32, kernel_size=3, padding=1)
-        self.deconv2 = nn.ConvTranspose1d(32, num_features, kernel_size=3, padding=1)
+        self.encoder_lstm3 = nn.LSTM(
+            input_size=self.hidden_size_2,
+            hidden_size=bottleneck_size,
+            num_layers=1,
+            batch_first=True
+        )
         
-        self.dropout = nn.Dropout(0.2)
-        self.norm = nn.LayerNorm(hidden_size)
+        # Decoder - gradually expand dimension
+        self.decoder_lstm1 = nn.LSTM(
+            input_size=bottleneck_size,
+            hidden_size=self.hidden_size_2,
+            num_layers=1,
+            batch_first=True
+        )
+        
+        self.decoder_lstm2 = nn.LSTM(
+            input_size=self.hidden_size_2,
+            hidden_size=self.hidden_size_1,
+            num_layers=1,
+            batch_first=True
+        )
+        
+        self.decoder_lstm3 = nn.LSTM(
+            input_size=self.hidden_size_1,
+            hidden_size=num_features,
+            num_layers=1,
+            batch_first=True
+        )
 
     def forward(self, x):
+        # x shape: [batch_size, lookback_len * num_features]
         batch_size = x.size(0)
         
         # Reshape to [batch_size, lookback_len, num_features]
         x = x.view(batch_size, self.lookback_len, self.num_features)
         
-        # Transform for Conv1d [batch_size, num_features, lookback_len]
-        x = x.transpose(1, 2)
+        # Encoding - progressively reduce dimensions
+        enc1_out, _ = self.encoder_lstm1(x)
+        enc2_out, _ = self.encoder_lstm2(enc1_out)
+        _, (bottleneck, _) = self.encoder_lstm3(enc2_out)
         
-        # Convolutional encoding
-        x = F.relu(self.conv1(x))
-        x = self.dropout(x)
-        x = F.relu(self.conv2(x))
+        # bottleneck shape: [1, batch_size, bottleneck_size]
+        # Repeat the bottleneck for each time step
+        bottleneck = bottleneck.permute(1, 0, 2)  # [batch_size, 1, bottleneck_size]
+        bottleneck_repeated = bottleneck.repeat(1, self.lookback_len, 1)  # [batch_size, lookback_len, bottleneck_size]
         
-        # Prepare for LSTM [batch_size, lookback_len, features]
-        x = x.transpose(1, 2)
-        
-        # LSTM encoding
-        enc_output, (hidden, cell) = self.encoder(x)
-        
-        # Apply attention
-        attn_output, _ = self.attention(enc_output, enc_output, enc_output)
-        attn_output = self.norm(attn_output + enc_output)  # Skip connection
-        
-        # Decoding
-        decoder_output, _ = self.decoder(attn_output, (hidden, cell))
-        
-        # Reshape for deconv [batch_size, channels, length]
-        x = decoder_output.transpose(1, 2)
-        
-        # Deconvolutional decoding
-        x = F.relu(self.deconv1(x))
-        x = self.dropout(x)
-        output = self.deconv2(x)
-        
-        # Final reshape [batch_size, lookback_len, num_features]
-        output = output.transpose(1, 2)
+        # Decoding - progressively increase dimensions
+        dec1_out, _ = self.decoder_lstm1(bottleneck_repeated)
+        dec2_out, _ = self.decoder_lstm2(dec1_out)
+        output, _ = self.decoder_lstm3(dec2_out)
         
         return output
 
 class MultivariateNormalDataPredictor():
-    def __init__(self, lstm_layer, lstm_unit, lookback_len, prediction_len, num_features):
-        hidden_size = lstm_unit
-        num_layers = lstm_layer
+    def __init__(self, lstm_unit, lookback_len, prediction_len, num_features):
         self.lookback_len = lookback_len
         self.prediction_len = prediction_len
         self.num_features = num_features
         
-        self.predictor = ConvLSTMAutoencoder(
-            num_features=num_features,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            lookback_len=lookback_len
-        )
+        # Unpack the LSTM sizes
+        hidden_size_1, hidden_size_2, bottleneck_size = lstm_unit
         
+        self.predictor = LSTMAutoencoder(
+            num_features=num_features,
+            bottleneck_size=bottleneck_size,
+            lookback_len=lookback_len,
+            hidden_sizes=[hidden_size_1, hidden_size_2]
+        )
+    
     def train(self, epoch, lr, data2learn):
         num_epochs = epoch
         learning_rate = lr
