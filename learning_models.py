@@ -97,156 +97,143 @@ class AnomalousThresholdGenerator():
             threshold = max(minimal_threshold, threshold[0,0])
         return threshold
 
-class ConvLSTMAutoencoder(nn.Module):
-    def __init__(self, num_features, hidden_size, num_layers, lookback_len):
-        super(ConvLSTMAutoencoder, self).__init__()
+class CNNLSTMPredictor(nn.Module):
+    """
+    CNN-LSTM model for multivariate time series prediction.
+    Removed bidirectional LSTM to ensure temporal causality.
+    """
+    def __init__(self, num_features, hidden_size, num_layers):
+        super(CNNLSTMPredictor, self).__init__()
+        
         self.num_features = num_features
         self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.lookback_len = lookback_len
         
-        # Convolutional layers
-        self.conv1 = nn.Conv1d(num_features, 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(32, 16, kernel_size=3, padding=1)
+        # CNN for temporal pattern extraction
+        self.conv1 = nn.Conv1d(in_channels=num_features, 
+                              out_channels=32, 
+                              kernel_size=3,
+                              padding=1)
+        self.relu1 = nn.ReLU()
         
-        # Encoder
-        self.encoder = nn.LSTM(
-            input_size=16,  
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True
-        )
+        # Unidirectional LSTM for sequence learning
+        self.lstm = nn.LSTM(input_size=32, 
+                           hidden_size=hidden_size, 
+                           num_layers=num_layers, 
+                           batch_first=True,
+                           bidirectional=False)  # Changed to unidirectional
         
-        # Attention mechanism
-        self.attention = nn.MultiheadAttention(hidden_size, num_heads=4)
+        # Output layer (removed *2 since we're not concatenating bidirectional outputs)
+        self.fc = nn.Linear(hidden_size, num_features)
         
-        # Decoder
-        self.decoder = nn.LSTM(
-            input_size=hidden_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True
-        )
-        
-        # Deconvolutional layers
-        self.deconv1 = nn.ConvTranspose1d(hidden_size, 32, kernel_size=3, padding=1)
-        self.deconv2 = nn.ConvTranspose1d(32, num_features, kernel_size=3, padding=1)
-        
-        self.dropout = nn.Dropout(0.2)
-        self.norm = nn.LayerNorm(hidden_size)
-
     def forward(self, x):
-        batch_size = x.size(0)
+        # x shape: (batch_size, sequence_length, num_features)
         
-        # Reshape to [batch_size, lookback_len, num_features]
-        x = x.view(batch_size, self.lookback_len, self.num_features)
+        # Reshape for CNN
+        x = x.permute(0, 2, 1)  # (batch_size, num_features, sequence_length)
         
-        # Transform for Conv1d [batch_size, num_features, lookback_len]
-        x = x.transpose(1, 2)
+        # Apply CNN
+        x = self.relu1(self.conv1(x))
         
-        # Convolutional encoding
-        x = F.relu(self.conv1(x))
-        x = self.dropout(x)
-        x = F.relu(self.conv2(x))
+        # Reshape for LSTM
+        x = x.permute(0, 2, 1)  # (batch_size, sequence_length, channels)
         
-        # Prepare for LSTM [batch_size, lookback_len, features]
-        x = x.transpose(1, 2)
+        # Apply LSTM
+        x, _ = self.lstm(x)
         
-        # LSTM encoding
-        enc_output, (hidden, cell) = self.encoder(x)
+        # Use last timestep
+        x = x[:, -1, :]
         
-        # Apply attention
-        attn_output, _ = self.attention(enc_output, enc_output, enc_output)
-        attn_output = self.norm(attn_output + enc_output)  # Skip connection
+        # Predict next timestep
+        out = self.fc(x)
         
-        # Decoding
-        decoder_output, _ = self.decoder(attn_output, (hidden, cell))
-        
-        # Reshape for deconv [batch_size, channels, length]
-        x = decoder_output.transpose(1, 2)
-        
-        # Deconvolutional decoding
-        x = F.relu(self.deconv1(x))
-        x = self.dropout(x)
-        output = self.deconv2(x)
-        
-        # Final reshape [batch_size, lookback_len, num_features]
-        output = output.transpose(1, 2)
-        
-        return output
+        return out
 
-class MultivariateNormalDataPredictor():
-    def __init__(self, lstm_layer, lstm_unit, lookback_len, prediction_len, num_features):
-        hidden_size = lstm_unit
-        num_layers = lstm_layer
-        self.lookback_len = lookback_len
-        self.prediction_len = prediction_len
+class MultivariateTimeSeriesPredictor:
+    """
+    Wrapper class for multivariate time series prediction.
+    """
+    def __init__(self, num_features, hidden_size=64, num_layers=2, lookback_len=5):
         self.num_features = num_features
+        self.lookback_len = lookback_len
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
         
-        self.predictor = ConvLSTMAutoencoder(
+        self.predictor = CNNLSTMPredictor(
             num_features=num_features,
             hidden_size=hidden_size,
-            num_layers=num_layers,
-            lookback_len=lookback_len
+            num_layers=num_layers
         )
         
-    def train(self, epoch, lr, data2learn):
-        num_epochs = epoch
-        learning_rate = lr
-
-        criterion = torch.nn.MSELoss()    
-        optimizer = torch.optim.Adam(self.predictor.parameters(), lr=learning_rate)
+    def prepare_data(self, data):
+        """Create sliding windows of input-output pairs."""
+        x, y = [], []
         
-        # Slide data
-        x, y = sliding_windows_multivariate(data2learn, self.lookback_len, self.prediction_len)
-        x = x.astype(float)
-        y = y.astype(float)
+        for i in range(len(data) - self.lookback_len):
+            x_i = data[i:i + self.lookback_len]
+            y_i = data[i + self.lookback_len]
+            
+            x.append(x_i)
+            y.append(y_i)
+            
+        return np.array(x), np.array(y)
         
-        # Prepare data for training
-        train_tensorX = torch.Tensor(np.array(x))
-        train_tensorY = torch.Tensor(np.array(y))
+    def train(self, epoch, lr, data):
+        """Train the model."""
+        x, y = self.prepare_data(data)
+        
+        train_tensorX = torch.Tensor(x)
+        train_tensorY = torch.Tensor(y)
+        
+        dataset = torch.utils.data.TensorDataset(train_tensorX, train_tensorY)
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=True)
+        
+        criterion = torch.nn.MSELoss()
+        optimizer = torch.optim.Adam(self.predictor.parameters(), lr=lr)
         
         self.predictor.train()
-        for epoch in range(num_epochs):
-            optimizer.zero_grad()
+        for epoch in range(epoch):
+            total_loss = 0
+            for batch_x, batch_y in dataloader:
+                optimizer.zero_grad()
+                
+                outputs = self.predictor(batch_x)
+                loss = criterion(outputs, batch_y)
+                
+                loss.backward()
+                optimizer.step()
+                
+                total_loss += loss.item()
             
-            # Forward pass
-            outputs = self.predictor(train_tensorX)
-            
-            # Calculate loss (reconstruction error)
-            loss = criterion(outputs, train_tensorX)
-            loss.backward()
-            optimizer.step()
-            
-        return train_tensorX, train_tensorY
+            if (epoch + 1) % 100 == 0:
+                print(f'Epoch [{epoch+1}/{epoch}], Loss: {total_loss/len(dataloader):.4f}')
         
-    def predict(self, x):
+        return train_tensorX, train_tensorY
+    
+    def predict(self, observed):
+        """Predict next timestep."""
         self.predictor.eval()
         with torch.no_grad():
-            predicted = self.predictor(x)
-            predicted = predicted.data.numpy()
-        return predicted
-        
-    def update(self, epoch_update, lr_update, past_observations, recent_observation):
-        num_epochs = epoch_update
-        learning_rate = lr_update
-        
-        criterion = torch.nn.MSELoss()    
-        optimizer = torch.optim.Adam(self.predictor.parameters(), lr=learning_rate)
+            predictions = self.predictor(observed)
+            if isinstance(predictions, torch.Tensor):
+                predictions = predictions.numpy()
+            if len(predictions.shape) == 2:
+                predictions = predictions[0]
+        return predictions
+    
+    def update(self, epoch_update, lr_update, past_observations, recent_observations):
+        """Update model with new observations."""
+        criterion = torch.nn.MSELoss()
+        optimizer = torch.optim.Adam(self.predictor.parameters(), lr=lr_update)
         
         self.predictor.train()
-        for epoch in range(num_epochs):
+        
+        for _ in range(epoch_update):
             optimizer.zero_grad()
             
-            # Forward pass
-            # past_observations shape: [1, lookback_len * num_features]
-            predicted_val = self.predictor(past_observations.float())
+            predicted_val = self.predictor(past_observations)
+            target = torch.from_numpy(np.array(recent_observations)).float().unsqueeze(0)
             
-            # The autoencoder outputs [batch_size, lookback_len, num_features]
-            batch_size = past_observations.size(0)
-            reshaped_input = past_observations.view(batch_size, self.lookback_len, self.num_features)
-            
-            # Calculate loss (reconstruction error)
-            loss = criterion(predicted_val, reshaped_input)
+            loss = criterion(predicted_val, target)
             loss.backward()
             optimizer.step()
+
