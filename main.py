@@ -11,45 +11,30 @@ import config as config
 from config import value_range_config
 
 torch.manual_seed(0)
-        
-# Extract the uncommented columns
-feature_columns = list(value_range_config.keys())
-
-# Initialize the value range database
-value_range_db = NormalValueRangeDb()
 
 class AdapAD:
-    def __init__(self, predictor_config, minimal_threshold):
+    def __init__(self, predictor_config, system_threshold):
         self.predictor_config = predictor_config
-        self.minimal_threshold = minimal_threshold
+        self.system_threshold = system_threshold  
         self.num_features = len(feature_columns)
         
         self.sensor_range = NormalValueRangeDb()
         
-        # Clear existing log files
-        if os.path.exists(config.log_dir):
-            # Remove all existing log files
-            for feature in feature_columns:
-                log_file_path = f"{config.log_dir}/{feature}_experiment_log.csv"
-                if os.path.exists(log_file_path):
-                    os.remove(log_file_path)
-            # Remove system log file
-            system_log_path = f"{config.log_dir}/system_experiment_log.csv"
-            if os.path.exists(system_log_path):
-                os.remove(system_log_path)
-        else:
-            os.makedirs(config.log_dir)
+        # Initialize parameter-specific thresholds from config
+        self.parameter_thresholds = {
+            param: config.parameter_config[param]['minimal_threshold']
+            for param in feature_columns
+        }
         
         # Initialize main log file path
-        self.main_log_file = f"{config.log_dir}/system_experiment_log.csv"
+        self.main_log_file = f"{config.log_dir}/system_log.csv"
         
-        # Use the new MultivariateTimeSeriesPredictor with correct parameters
+        # Initialize predictor
         self.data_predictor = MultivariateTimeSeriesPredictor(
             num_features=self.num_features,
             hidden_size=config.LSTM_size,
             num_layers=config.LSTM_size_layer,
             lookback_len=self.predictor_config['lookback_len']
-            # Remove prediction_len as it's not needed - we only predict next timestep
         )
         
         # Initialize threshold generator
@@ -62,44 +47,26 @@ class AdapAD:
         
         self.predicted_vals = PredictedNormalDataDb()
         self.thresholds = AnomalousThresholdDb()
-        self.thresholds.append(self.minimal_threshold)
+        self.thresholds.append(self.system_threshold)
         self.anomalies = []
-        
-        self.predictive_errors = None
-        self.window_size = predictor_config['lookback_len'] * 2  # Adjust window size as needed
-        self.running_stats = {}  # Store running min/max for each feature
 
-    def __initialize_running_stats(self, feature_idx):
-        """Initialize running statistics for a feature"""
-        self.running_stats[feature_idx] = {
-            'min': float('inf'),
-            'max': float('-inf'),
-            'values': []
-        }
+        # Create log directory if it doesn't exist
+        if not os.path.exists(config.log_dir):
+            os.makedirs(config.log_dir)
 
-    def __update_running_stats(self, value, feature_idx):
-        """Update running min/max statistics for dynamic normalization"""
-        if feature_idx not in self.running_stats:
-            self.__initialize_running_stats(feature_idx)
-            
-        stats = self.running_stats[feature_idx]
-        stats['values'].append(value)
-        
-        # Keep only recent values
-        if len(stats['values']) > self.window_size:
-            stats['values'].pop(0)
-            
-        # Update min/max based on recent window
-        stats['min'] = min(stats['values'])
-        stats['max'] = max(stats['values'])
-        
-        # Ensure we have some range to normalize
-        if stats['min'] == stats['max']:
-            stats['min'] -= 0.1
-            stats['max'] += 0.1
+        # Initialize main system log file
+        if not os.path.exists(self.main_log_file):
+            with open(self.main_log_file, 'w') as f:
+                f.write("idx,is_anomalous,error,threshold\n")
+
+        # Initialize feature-specific log files
+        for feature in feature_columns:
+            log_file_path = f"{config.log_dir}/{feature}_log.csv"
+            if not os.path.exists(log_file_path):
+                with open(log_file_path, 'w') as f:
+                    f.write("idx,observed,predicted,lower_bound,upper_bound,is_anomalous,error,threshold\n")
 
     def __normalize_data(self, data):
-        """Normalize data using static ranges from config"""
         normalized_data = np.zeros_like(data)
         for i, value in enumerate(data):
             feature = feature_columns[i]
@@ -109,7 +76,6 @@ class AdapAD:
         return normalized_data
 
     def __reverse_normalized_data(self, normalized_val, feature_idx):
-        """Reverse normalization using static ranges from config"""
         feature = feature_columns[feature_idx]
         min_val, max_val = value_range_config[feature]
         return normalized_val * (max_val - min_val) + min_val
@@ -125,9 +91,6 @@ class AdapAD:
         self.training_data = normalized_training_data
 
     def train(self):
-        if not hasattr(self, 'training_data'):
-            raise ValueError("Training data not set. Call set_training_data first.")
-            
         # Train Predictor with multivariate data
         trainX, trainY = self.data_predictor.train(
             config.epoch_train,
@@ -135,8 +98,6 @@ class AdapAD:
             self.training_data
         )
         
-        # Calculate initial errors using MSE
-        predicted_values = []
         errors = []
         
         # Process model outputs
@@ -144,7 +105,7 @@ class AdapAD:
         
         # Calculate prediction errors from training data
         for i in range(len(trainX)):
-            input_tensor = torch.Tensor(trainX[i]).unsqueeze(0)  # Add batch dimension
+            input_tensor = torch.Tensor(trainX[i]).unsqueeze(0)  
             train_predicted_val = self.data_predictor.predict(input_tensor)
             
             # Use the first feature as the target for error calculation
@@ -159,72 +120,42 @@ class AdapAD:
         
         # Train threshold generator
         self.generator.train(config.epoch_train, config.lr_train, original_errors)
-
-    def calculate_reconstruction_error(self, predicted, observed):
-        # Ensure both arrays are proper numpy arrays
-        if isinstance(predicted, torch.Tensor):
-            predicted = predicted.detach().numpy()
-            
-        observed_np = np.array(observed)
         
-        # Calculate errors for all features
-        errors = predicted - observed_np
-        
-        # Calculate MSE for each feature
-        self.current_errors = np.abs(errors)  # Store raw errors for logging
-        reconstruction_error = np.mean(errors ** 2)  # Overall reconstruction error
-        
-        return reconstruction_error
-
-    def get_feature_weights(self):
-        """Helper method to monitor how weights are being assigned to features"""
-        if hasattr(self, 'current_weights'):
-            return dict(zip(feature_columns, self.current_weights))
-        return None
-
     def is_anomalous(self, observed_val):
-        """
-        Detect anomalies in the current observation using past observations for prediction.
-        """
-        print("\n=== Debug: is_anomalous() ===")
-        print("Current observation (all features):", observed_val)
-        
         # Convert input to numpy array and handle missing values
         observed_val = np.array([float(x) if x != '' else np.nan for x in observed_val])
         
         if np.any(np.isnan(observed_val)):
-            print("Found NaN values, marking as anomaly")
             self.anomalies.append(self.observed_vals.get_length())
             self.observed_vals.append(np.zeros_like(observed_val))  
             return True
         
+        # Check if any value is outside its sensor range
+        for i, val in enumerate(observed_val):
+            if not self.is_inside_range(self.__normalize_data(observed_val)[i], i):
+                self.anomalies.append(self.observed_vals.get_length())
+                self.observed_vals.append(np.zeros_like(observed_val))
+                return True
+        
         # Normalize using config ranges
         normalized_val = self.__normalize_data(observed_val)
-        
-        print("\nNormalized values for each feature:")
-        for i, feature in enumerate(feature_columns):
-            print(f"{feature}: {normalized_val[i]:.4f} (original: {observed_val[i]:.4f})")
         
         # Get lookback window of past observations
         past_observations = self.observed_vals.get_tail(self.predictor_config['lookback_len'])
         
         if len(past_observations) < self.predictor_config['lookback_len']:
-            print("\nNot enough history, adding current observation and continuing")
             self.observed_vals.append(normalized_val)
             return False
         
-        print("\nPast observations window (showing all features):")
         past_observations = np.array(past_observations)
         for t in range(len(past_observations)):
             denorm_values = []
             for i in range(len(feature_columns)):
                 denorm_val = self.__reverse_normalized_data(past_observations[t][i], i)
                 denorm_values.append(denorm_val)
-            print(f"t-{len(past_observations)-t}: {denorm_values}")
         
         # Prepare past observations for prediction
         past_observations_tensor = torch.Tensor(past_observations).unsqueeze(0)
-        print("\nInput tensor shape:", past_observations_tensor.shape)
         
         # Make prediction
         predicted_val = self.data_predictor.predict(past_observations_tensor)
@@ -233,42 +164,39 @@ class AdapAD:
         if len(predicted_val.shape) == 2:
             predicted_val = predicted_val[0]
         
-        print("\nPredictions vs Actuals:")
-        for i, feature in enumerate(feature_columns):
-            pred_denorm = self.__reverse_normalized_data(predicted_val[i], i)
-            obs_denorm = observed_val[i]  # Original value is already denormalized
-            print(f"{feature}:")
-            print(f"  Predicted: {pred_denorm:.4f}")
-            print(f"  Actual: {obs_denorm:.4f}")
-        
-        # Calculate errors
+        # Calculate errors and check individual parameter thresholds
         errors = predicted_val - normalized_val
         self.current_errors = np.abs(errors)
-        reconstruction_error = np.mean(errors ** 2)
+        mean_squared_error = np.mean(errors ** 2)  
         
-        # Get threshold
+        # Check if any parameter exceeds its specific threshold
+        is_anomalous_ret = False
+        for i, feature in enumerate(feature_columns):
+            if self.current_errors[i] > self.parameter_thresholds[feature]:
+                is_anomalous_ret = True
+                break
+        
+        # If no individual parameter is anomalous, check system-wide MSE
+        if not is_anomalous_ret:
+            is_anomalous_ret = mean_squared_error > self.system_threshold
+        
+        # Get threshold for logging 
         if self.predictive_errors and self.predictive_errors.get_length() >= self.predictor_config['lookback_len']:
             past_errors = np.array(self.predictive_errors.get_tail(self.predictor_config['lookback_len']))
             past_errors_tensor = torch.Tensor(past_errors).reshape(1, -1)
-            threshold = self.generator.generate(past_errors_tensor, self.minimal_threshold)
-            threshold = max(threshold, self.minimal_threshold)
+            threshold = self.generator.generate(past_errors_tensor, self.system_threshold)
+            threshold = max(threshold, self.system_threshold)
             self.thresholds.append(threshold)
         else:
-            threshold = self.minimal_threshold
+            threshold = self.system_threshold
         
-        print(f"\nReconstruction error: {reconstruction_error:.6f}")
-        print(f"Threshold: {threshold:.6f}")
-        
-        # Determine if anomalous
-        is_anomalous_ret = reconstruction_error > threshold
-        
-        # Log and update
-        self.__logging(is_anomalous_ret, normalized_val, predicted_val, threshold, reconstruction_error)
+        # Logging
+        self.__logging(is_anomalous_ret, normalized_val, predicted_val, threshold, mean_squared_error)
         self.observed_vals.append(normalized_val)
         self.predicted_vals.append(predicted_val)
-        self.predictive_errors.append(reconstruction_error)
+        self.predictive_errors.append(mean_squared_error)
         
-        # Update model
+        # Update models
         self.data_predictor.update(
             config.epoch_update,
             config.lr_update,
@@ -276,12 +204,12 @@ class AdapAD:
             normalized_val
         )
         
-        if threshold > self.minimal_threshold:
+        if threshold > self.system_threshold:
             self.generator.update(
                 config.update_G_epoch,
                 config.update_G_lr,
                 past_errors_tensor,
-                reconstruction_error
+                mean_squared_error
             )
         
         if is_anomalous_ret:
@@ -289,18 +217,13 @@ class AdapAD:
         
         return is_anomalous_ret
 
-    def __logging(self, is_anomalous_ret, normalized_val, predicted_val, threshold, reconstruction_error):
+    def __logging(self, is_anomalous_ret, normalized_val, predicted_val, threshold, mean_squared_error):
         try:
             current_idx = self.observed_vals.get_length() - 1
             
             # Log for each feature
             for i, feature in enumerate(feature_columns):
-                log_file_path = f"{config.log_dir}/{feature}_experiment_log.csv"
-                
-                # Write header if file is empty/new
-                if not os.path.exists(log_file_path):
-                    with open(log_file_path, 'w') as f:
-                        f.write("idx,observed,predicted,lower_bound,upper_bound,is_anomalous,error,threshold\n")
+                log_file_path = f"{config.log_dir}/{feature}_log.csv"
                 
                 # Append data
                 with open(log_file_path, 'a') as f:
@@ -308,25 +231,28 @@ class AdapAD:
                     observed_val = self.__reverse_normalized_data(normalized_val[i], i)
                     predicted_val_denorm = self.__reverse_normalized_data(predicted_val[i], i)
                     
-                    # Calculate bounds by adding/subtracting threshold in normalized space
-                    lower_bound_norm = predicted_val[i] - threshold
-                    upper_bound_norm = predicted_val[i] + threshold
+                    # Use parameter-specific threshold for individual features
+                    parameter_threshold = self.parameter_thresholds[feature]
+                    
+                    # Calculate bounds using parameter-specific threshold
+                    lower_bound_norm = predicted_val[i] - parameter_threshold
+                    upper_bound_norm = predicted_val[i] + parameter_threshold
                     
                     # Then denormalize the bounds
                     lower_bound = self.__reverse_normalized_data(lower_bound_norm, i)
                     upper_bound = self.__reverse_normalized_data(upper_bound_norm, i)
                     
                     text2write = f"{current_idx},{observed_val},{predicted_val_denorm},{lower_bound},{upper_bound},"
-                    text2write += f"{self.current_errors[i] > threshold},{self.current_errors[i]:.6f},{threshold:.6f}\n"
+                    text2write += f"{self.current_errors[i] > parameter_threshold},{self.current_errors[i]:.6f},{parameter_threshold:.6f}\n"
                     f.write(text2write)
             
-            # Log system metrics
+            # Log system metrics (using system-wide threshold for MSE)
             if not os.path.exists(self.main_log_file):
                 with open(self.main_log_file, 'w') as f:
                     f.write("idx,is_anomalous,error,threshold\n")
                 
             with open(self.main_log_file, 'a') as f:
-                f.write(f"{current_idx},{is_anomalous_ret},{reconstruction_error:.6f},{threshold:.6f}\n")
+                f.write(f"{current_idx},{is_anomalous_ret},{mean_squared_error:.6f},{self.system_threshold:.6f}\n")
                 
         except Exception as e:
             import traceback
@@ -338,9 +264,6 @@ class AdapAD:
         self.predictive_errors.clean(self.predictor_config['lookback_len'])
         self.thresholds.clean(self.predictor_config['lookback_len'])
         
-    def close_logs(self):
-        pass
-
     def is_inside_range(self, val, feature_idx=0):
         observed_val = self.__reverse_normalized_data(val, feature_idx)
         if observed_val >= self.sensor_range.lower(feature_idx) and observed_val <= self.sensor_range.upper(feature_idx):
@@ -348,12 +271,12 @@ class AdapAD:
         else:
             return False
 
-    def log_transform_errors(self, errors, epsilon=1e-15):
-        errors_array = np.array(errors) + epsilon
-        log_errors = np.log10(errors_array)
-        return log_errors
-
 if __name__ == "__main__":
+
+    feature_columns = list(value_range_config.keys())
+
+    value_range_db = NormalValueRangeDb()
+
     predictor_config, value_range_config, minimal_threshold = config.init_config()
     if not minimal_threshold:
         raise Exception("It is mandatory to set a minimal threshold")

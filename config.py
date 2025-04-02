@@ -6,7 +6,22 @@ import os
 data_source_path = "data/Austevoll_Autumn_2023_no_dcps_small.csv"
 
 # Data source configuration
-data_source = "LSTM-AE" 
+data_source = "Austevoll" 
+
+parameter_config = {
+    "conductivity_conductivity": {
+        "value_range": (25.0, 38.0),
+        "minimal_threshold": 0.2
+    },
+    "pressure_pressure": {
+        "value_range": (299.0, 321.0),
+        "minimal_threshold": 0.1
+    },
+    "pressure_temperature": {
+        "value_range": (5.0, 17.0),
+        "minimal_threshold": 0.01
+    }
+}
 
 # Configuration using column names
 value_range_config = {
@@ -17,12 +32,6 @@ value_range_config = {
     #"conductivity_soundspeed": (1460.0, 1510.0),
     "pressure_pressure": (299.0, 321.0),
     "pressure_temperature": (5.0, 17.0)
-}
-
-weight_config = {
-    "conductivity_conductivity": 0.15,
-    "pressure_pressure": 0.04,
-    "pressure_temperature": 2.5
 }
 
 # Extract the uncommented columns
@@ -59,6 +68,6 @@ def init_config():
                                      predictor_config['prediction_len'] 
     
     # Minimal threshold for anomaly detection
-    minimal_threshold = 0.01
+    system_threshold = 0.01
     
-    return predictor_config, value_range_config, minimal_threshold
+    return predictor_config, value_range_config, system_threshold

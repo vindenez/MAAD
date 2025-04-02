@@ -98,10 +98,6 @@ class AnomalousThresholdGenerator():
         return threshold
 
 class CNNLSTMPredictor(nn.Module):
-    """
-    CNN-LSTM model for multivariate time series prediction.
-    Removed bidirectional LSTM to ensure temporal causality.
-    """
     def __init__(self, num_features, hidden_size, num_layers):
         super(CNNLSTMPredictor, self).__init__()
         
@@ -113,45 +109,29 @@ class CNNLSTMPredictor(nn.Module):
                               out_channels=32, 
                               kernel_size=3,
                               padding=1)
+        
         self.relu1 = nn.ReLU()
         
         # Unidirectional LSTM for sequence learning
         self.lstm = nn.LSTM(input_size=32, 
                            hidden_size=hidden_size, 
                            num_layers=num_layers, 
-                           batch_first=True,
-                           bidirectional=False)  # Changed to unidirectional
+                           batch_first=True)  
         
-        # Output layer (removed *2 since we're not concatenating bidirectional outputs)
         self.fc = nn.Linear(hidden_size, num_features)
         
     def forward(self, x):
-        # x shape: (batch_size, sequence_length, num_features)
-        
         # Reshape for CNN
         x = x.permute(0, 2, 1)  # (batch_size, num_features, sequence_length)
-        
-        # Apply CNN
         x = self.relu1(self.conv1(x))
-        
-        # Reshape for LSTM
         x = x.permute(0, 2, 1)  # (batch_size, sequence_length, channels)
-        
-        # Apply LSTM
         x, _ = self.lstm(x)
-        
-        # Use last timestep
         x = x[:, -1, :]
-        
-        # Predict next timestep
         out = self.fc(x)
         
         return out
 
 class MultivariateTimeSeriesPredictor:
-    """
-    Wrapper class for multivariate time series prediction.
-    """
     def __init__(self, num_features, hidden_size=64, num_layers=2, lookback_len=5):
         self.num_features = num_features
         self.lookback_len = lookback_len
@@ -165,7 +145,6 @@ class MultivariateTimeSeriesPredictor:
         )
         
     def prepare_data(self, data):
-        """Create sliding windows of input-output pairs."""
         x, y = [], []
         
         for i in range(len(data) - self.lookback_len):
@@ -178,14 +157,12 @@ class MultivariateTimeSeriesPredictor:
         return np.array(x), np.array(y)
         
     def train(self, epoch, lr, data):
-        """Train the model."""
         x, y = self.prepare_data(data)
+        x, y = x.astype(float), y.astype(float)
         
-        train_tensorX = torch.Tensor(x)
-        train_tensorY = torch.Tensor(y)
-        
-        dataset = torch.utils.data.TensorDataset(train_tensorX, train_tensorY)
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=True)
+        # Convert to PyTorch tensors
+        train_tensorX = torch.Tensor(np.array(x))
+        train_tensorY = torch.Tensor(np.array(y))
         
         criterion = torch.nn.MSELoss()
         optimizer = torch.optim.Adam(self.predictor.parameters(), lr=lr)
@@ -193,35 +170,34 @@ class MultivariateTimeSeriesPredictor:
         self.predictor.train()
         for epoch in range(epoch):
             total_loss = 0
-            for batch_x, batch_y in dataloader:
+            # Iterate through each sliding window
+            for i in range(len(x)):
                 optimizer.zero_grad()
                 
-                outputs = self.predictor(batch_x)
-                loss = criterion(outputs, batch_y)
+                _x, _y = x[i], y[i]
+                # Add batch dimension and make prediction
+                outputs = self.predictor(torch.Tensor(_x).unsqueeze(0))
+                loss = criterion(outputs, torch.Tensor(_y).unsqueeze(0))
                 
-                loss.backward()
+                loss.backward(retain_graph=True)
                 optimizer.step()
                 
                 total_loss += loss.item()
             
             if (epoch + 1) % 100 == 0:
-                print(f'Epoch [{epoch+1}/{epoch}], Loss: {total_loss/len(dataloader):.4f}')
+                print(f'Epoch [{epoch+1}/{epoch}], Loss: {total_loss/len(x):.4f}')
         
         return train_tensorX, train_tensorY
     
     def predict(self, observed):
-        """Predict next timestep."""
         self.predictor.eval()
         with torch.no_grad():
             predictions = self.predictor(observed)
             if isinstance(predictions, torch.Tensor):
                 predictions = predictions.numpy()
-            if len(predictions.shape) == 2:
-                predictions = predictions[0]
         return predictions
     
     def update(self, epoch_update, lr_update, past_observations, recent_observations):
-        """Update model with new observations."""
         criterion = torch.nn.MSELoss()
         optimizer = torch.optim.Adam(self.predictor.parameters(), lr=lr_update)
         
