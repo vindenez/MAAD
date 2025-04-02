@@ -1,6 +1,6 @@
-An implementation of Adaptive Anomaly Detector (AdapAD) for multivariate input using a LSTM-Autoencoder based neural network architecture.
+An implementation of Adaptive Anomaly Detector (AdapAD) for multivariate input using a CNN-LSTM based neural network architecture. 
 
-The model aims to detect anomalous measurements from real-time multivariate time series data.
+The model aims to detect anomalous measurements from real-time multivariate time series data using prediction method.
 
 ## References
 > Nguyen, N.T., Heldal, R. and Pelliccione, P., 2024. Concept-drift-adaptive anomaly detector for marine sensor data streams. Internet of Things, p.101414.
