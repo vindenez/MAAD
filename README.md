@@ -1,4 +1,4 @@
-An implementation of Adaptive Anomaly Detector (AdapAD) for multivariate input using a CNN-LSTM based neural network architecture. 
+An implementation of Adaptive Anomaly Detector (AdapAD) for multivariate input using a Conv-LSTM based neural network architecture. 
 
 The model aims to detect anomalous measurements from real-time multivariate time series data using prediction method.
 
