@@ -59,6 +59,6 @@ def init_config():
                                      predictor_config['prediction_len'] 
     
     # Minimal threshold for anomaly detection
-    minimal_threshold = 1.1
+    minimal_threshold = 0.01
     
     return predictor_config, value_range_config, minimal_threshold

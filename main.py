@@ -99,30 +99,19 @@ class AdapAD:
             stats['max'] += 0.1
 
     def __normalize_data(self, data):
-        """Dynamic normalization based on recent history"""
+        """Normalize data using static ranges from config"""
         normalized_data = np.zeros_like(data)
         for i, value in enumerate(data):
-            self.__update_running_stats(value, i)
-            stats = self.running_stats[i]
-            
-            # Normalize using running statistics
-            normalized_data[i] = (value - stats['min']) / (stats['max'] - stats['min'])
-            
-            # Clip to ensure we stay in [0,1]
+            feature = feature_columns[i]
+            min_val, max_val = value_range_config[feature]
+            normalized_data[i] = (value - min_val) / (max_val - min_val)
             normalized_data[i] = np.clip(normalized_data[i], 0, 1)
-            
         return normalized_data
 
     def __reverse_normalized_data(self, normalized_val, feature_idx):
-        """Reverse normalization using running statistics"""
-        if feature_idx not in self.running_stats:
-            # Fallback to static normalization if no running stats
-            feature = feature_columns[feature_idx]
-            min_val, max_val = value_range_config[feature]
-        else:
-            stats = self.running_stats[feature_idx]
-            min_val, max_val = stats['min'], stats['max']
-            
+        """Reverse normalization using static ranges from config"""
+        feature = feature_columns[feature_idx]
+        min_val, max_val = value_range_config[feature]
         return normalized_val * (max_val - min_val) + min_val
 
     def set_training_data(self, training_data):
@@ -196,10 +185,9 @@ class AdapAD:
     def is_anomalous(self, observed_val):
         """
         Detect anomalies in the current observation using past observations for prediction.
-        Returns True if the observation is anomalous, False otherwise.
         """
         print("\n=== Debug: is_anomalous() ===")
-        print(f"Current observation to predict: {observed_val}")
+        print("Current observation (all features):", observed_val)
         
         # Convert input to numpy array and handle missing values
         observed_val = np.array([float(x) if x != '' else np.nan for x in observed_val])
@@ -210,55 +198,55 @@ class AdapAD:
             self.observed_vals.append(np.zeros_like(observed_val))  
             return True
         
-        # Normalize current observation
+        # Normalize using config ranges
         normalized_val = self.__normalize_data(observed_val)
-        print(f"Normalized current observation: {normalized_val}")
+        
+        print("\nNormalized values for each feature:")
+        for i, feature in enumerate(feature_columns):
+            print(f"{feature}: {normalized_val[i]:.4f} (original: {observed_val[i]:.4f})")
         
         # Get lookback window of past observations
         past_observations = self.observed_vals.get_tail(self.predictor_config['lookback_len'])
-        print(f"\nPast observations window size: {len(past_observations)}")
-        print("Last 3 past observations:")
-        for i, obs in enumerate(past_observations[-3:]):
-            print(f"t-{len(past_observations)-i}: {self.__reverse_normalized_data(obs[0], 0)}")
         
         if len(past_observations) < self.predictor_config['lookback_len']:
-            print("Not enough history, adding current observation and continuing")
+            print("\nNot enough history, adding current observation and continuing")
             self.observed_vals.append(normalized_val)
             return False
         
-        # Debug: Check current state of observed_vals
-        print("\nCurrent state of observed_vals:")
-        all_obs = self.observed_vals.get_tail(self.observed_vals.get_length())
-        print(f"Total observations stored: {len(all_obs)}")
-        print(f"Last stored observation: {self.__reverse_normalized_data(all_obs[-1][0], 0)}")
+        print("\nPast observations window (showing all features):")
+        past_observations = np.array(past_observations)
+        for t in range(len(past_observations)):
+            denorm_values = []
+            for i in range(len(feature_columns)):
+                denorm_val = self.__reverse_normalized_data(past_observations[t][i], i)
+                denorm_values.append(denorm_val)
+            print(f"t-{len(past_observations)-t}: {denorm_values}")
         
         # Prepare past observations for prediction
-        past_observations = np.array(past_observations)
         past_observations_tensor = torch.Tensor(past_observations).unsqueeze(0)
-        
-        print("\nShape of input to predictor:", past_observations_tensor.shape)
-        print("Values used for prediction (denormalized):")
-        for i in range(len(past_observations)):
-            print(f"t-{len(past_observations)-i}: {self.__reverse_normalized_data(past_observations[i][0], 0)}")
+        print("\nInput tensor shape:", past_observations_tensor.shape)
         
         # Make prediction
         predicted_val = self.data_predictor.predict(past_observations_tensor)
-        
-        # Ensure predicted_val is numpy array with shape (num_features,)
         if isinstance(predicted_val, torch.Tensor):
             predicted_val = predicted_val.detach().numpy()
         if len(predicted_val.shape) == 2:
             predicted_val = predicted_val[0]
         
-        print(f"\nPredicted value (denormalized): {self.__reverse_normalized_data(predicted_val[0], 0)}")
-        print(f"Actual value (denormalized): {self.__reverse_normalized_data(normalized_val[0], 0)}")
+        print("\nPredictions vs Actuals:")
+        for i, feature in enumerate(feature_columns):
+            pred_denorm = self.__reverse_normalized_data(predicted_val[i], i)
+            obs_denorm = observed_val[i]  # Original value is already denormalized
+            print(f"{feature}:")
+            print(f"  Predicted: {pred_denorm:.4f}")
+            print(f"  Actual: {obs_denorm:.4f}")
         
-        # Calculate errors between predicted and actual values
+        # Calculate errors
         errors = predicted_val - normalized_val
         self.current_errors = np.abs(errors)
         reconstruction_error = np.mean(errors ** 2)
         
-        # Get or update anomaly threshold
+        # Get threshold
         if self.predictive_errors and self.predictive_errors.get_length() >= self.predictor_config['lookback_len']:
             past_errors = np.array(self.predictive_errors.get_tail(self.predictor_config['lookback_len']))
             past_errors_tensor = torch.Tensor(past_errors).reshape(1, -1)
@@ -268,26 +256,19 @@ class AdapAD:
         else:
             threshold = self.minimal_threshold
         
+        print(f"\nReconstruction error: {reconstruction_error:.6f}")
+        print(f"Threshold: {threshold:.6f}")
+        
         # Determine if anomalous
-        is_anomalous_ret = False
+        is_anomalous_ret = reconstruction_error > threshold
         
-        # Check if any value is outside its normal range
-        if not all(self.is_inside_range(val, i) for i, val in enumerate(normalized_val)):
-            is_anomalous_ret = True
-        # Check if reconstruction error exceeds threshold
-        elif reconstruction_error > threshold:
-            is_anomalous_ret = True
-        
-        # Log results before updating history
+        # Log and update
         self.__logging(is_anomalous_ret, normalized_val, predicted_val, threshold, reconstruction_error)
-        
-        # Always update history to maintain temporal sequence
         self.observed_vals.append(normalized_val)
         self.predicted_vals.append(predicted_val)
         self.predictive_errors.append(reconstruction_error)
         
-        # Always update the model with the true observation, even if anomalous
-        # This helps the model adapt to changing patterns
+        # Update model
         self.data_predictor.update(
             config.epoch_update,
             config.lr_update,
@@ -295,7 +276,6 @@ class AdapAD:
             normalized_val
         )
         
-        # Update threshold generator
         if threshold > self.minimal_threshold:
             self.generator.update(
                 config.update_G_epoch,
@@ -304,7 +284,6 @@ class AdapAD:
                 reconstruction_error
             )
         
-        # Record anomaly if detected
         if is_anomalous_ret:
             self.anomalies.append(self.observed_vals.get_length())
         
@@ -325,10 +304,17 @@ class AdapAD:
                 
                 # Append data
                 with open(log_file_path, 'a') as f:
+                    # First denormalize the observed and predicted values
                     observed_val = self.__reverse_normalized_data(normalized_val[i], i)
                     predicted_val_denorm = self.__reverse_normalized_data(predicted_val[i], i)
-                    lower_bound = self.__reverse_normalized_data(max(0, predicted_val[i] - threshold), i)
-                    upper_bound = self.__reverse_normalized_data(min(1, predicted_val[i] + threshold), i)
+                    
+                    # Calculate bounds by adding/subtracting threshold in normalized space
+                    lower_bound_norm = predicted_val[i] - threshold
+                    upper_bound_norm = predicted_val[i] + threshold
+                    
+                    # Then denormalize the bounds
+                    lower_bound = self.__reverse_normalized_data(lower_bound_norm, i)
+                    upper_bound = self.__reverse_normalized_data(upper_bound_norm, i)
                     
                     text2write = f"{current_idx},{observed_val},{predicted_val_denorm},{lower_bound},{upper_bound},"
                     text2write += f"{self.current_errors[i] > threshold},{self.current_errors[i]:.6f},{threshold:.6f}\n"
