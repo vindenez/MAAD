@@ -6,7 +6,7 @@ import os
 import glob
 
 # Configuration
-logs_directory = 'results/LSTM-AE/'  # LSTM-AE logs directory
+logs_directory = 'results/Austevoll/'  # LSTM-AE logs directory
 
 # Feature configuration from config.py
 feature_columns = [
@@ -22,24 +22,27 @@ value_range_config = {
     "pressure_temperature": (5.0, 17.0)
 }
 
+# Dictionary to store anomalies for each feature
+feature_anomalies = {}
+
 # Check if system log file exists
-system_log_path = os.path.join(logs_directory, 'system_experiment_log.csv')
+system_log_path = os.path.join(logs_directory, 'system_alog.csv')
 if os.path.exists(system_log_path):
     system_log_df = pd.read_csv(system_log_path)
     # Extract anomalies from system log (where is_anomalous is True)
     anomaly_indices = system_log_df[system_log_df['is_anomalous'] == True]['idx'].tolist()
     print(f"Found {len(anomaly_indices)} system-level anomalies")
 else:
-    # If no system log, try to collect anomalies from individual feature logs
+    # If no system log, collect anomalies from individual feature logs
     anomaly_indices = []
     
     for feature in feature_columns:
-        feature_log_path = os.path.join(logs_directory, f"{feature}_experiment_log.csv")
+        feature_log_path = os.path.join(logs_directory, f"{feature}_log.csv")
         if os.path.exists(feature_log_path):
             log_df = pd.read_csv(feature_log_path)
             # Extract anomalies
-            feature_anomalies = log_df[log_df['is_anomalous'] == True]['idx'].tolist()
-            anomaly_indices.extend(feature_anomalies)
+            feature_anomalies[feature] = log_df[log_df['is_anomalous'] == True]['idx'].tolist()
+            anomaly_indices.extend(feature_anomalies[feature])
     
     # Remove duplicates
     anomaly_indices = sorted(set(anomaly_indices))
@@ -51,9 +54,16 @@ fig, ax = plt.subplots(figsize=(16, 8))
 # Dictionary to store max index for each feature
 max_idx = 0
 
+# Define colors for different features
+feature_colors = {
+    "conductivity_conductivity": "blue",
+    "pressure_pressure": "green",
+    "pressure_temperature": "purple"
+}
+
 # Load observed values from log files and plot normalized values
 for feature in feature_columns:
-    feature_log_path = os.path.join(logs_directory, f"{feature}_experiment_log.csv")
+    feature_log_path = os.path.join(logs_directory, f"{feature}_log.csv")
     
     if not os.path.exists(feature_log_path):
         print(f"Log file for {feature} not found.")
@@ -70,25 +80,37 @@ for feature in feature_columns:
     normalized_values = np.clip(normalized_values, 0, 1)
     
     # Plot the normalized values
-    ax.plot(log_df['idx'], normalized_values, label=feature, linewidth=1.5)
+    ax.plot(log_df['idx'], normalized_values, label=feature, linewidth=1.5, color=feature_colors[feature])
     
     # Update max index
     max_idx = max(max_idx, log_df['idx'].max())
 
-# Mark anomalies with vertical lines
-for idx in anomaly_indices:
-    ax.axvline(x=idx, color='red', linestyle='-', alpha=0.3, linewidth=2.5)
+# Mark anomalies with vertical lines using feature-specific colors
+for feature in feature_columns:
+    if feature in feature_anomalies:
+        for idx in feature_anomalies[feature]:
+            ax.axvline(x=idx, color=feature_colors[feature], linestyle='-', alpha=0.3, linewidth=2.5)
 
 # Add text label for the number of anomalies
 ax.text(0.02, 0.02, f"Total anomalies: {len(anomaly_indices)}", transform=ax.transAxes, 
          bbox=dict(facecolor='white', alpha=0.7), fontsize=10)
 
-# Create custom legend with anomaly marker
-anomaly_line = Line2D([0], [0], color='red', linestyle='solid', linewidth=2.5, alpha=0.3)
-handles, labels = ax.get_legend_handles_labels()
-handles.append(anomaly_line)
-labels.append('Anomalies')
-ax.legend(handles=handles, labels=labels, loc='upper right', fontsize=10)
+# Create custom legend with anomaly markers
+legend_handles = []
+legend_labels = []
+
+# Add feature lines to legend
+for feature in feature_columns:
+    legend_handles.append(Line2D([0], [0], color=feature_colors[feature], linewidth=1.5))
+    legend_labels.append(feature)
+
+# Add anomaly markers to legend
+for feature in feature_columns:
+    if feature in feature_anomalies:
+        legend_handles.append(Line2D([0], [0], color=feature_colors[feature], linestyle='solid', linewidth=2.5, alpha=0.3))
+        legend_labels.append(f'{feature} anomalies')
+
+ax.legend(handles=legend_handles, labels=legend_labels, loc='upper right', fontsize=10)
 
 # Set y-axis limits to the normalized range
 ax.set_ylim(0, 1)
@@ -101,7 +123,7 @@ ax.axhline(y=0, color='gray', linestyle='-', alpha=0.5, linewidth=1)
 ax.axhline(y=1, color='gray', linestyle='-', alpha=0.5, linewidth=1)
 
 # Add title and labels
-ax.set_title('Normalized Sensor Values with Weighted Anomaly Detection (LSTM-AE)', fontsize=14)
+ax.set_title('Normalized Sensor Values with Feature-Specific Anomaly Detection (LSTM-AE)', fontsize=14)
 ax.set_xlabel('Timestep', fontsize=12)
 ax.set_ylabel('Normalized Value [0-1]', fontsize=12)
 

@@ -8,33 +8,79 @@ from utils import *
 from learning_models import *
 from supporting_components import *
 import config as config
-from config import value_range_config
+from config import value_range_config, feature_columns, data_source as config_data_source
 
 torch.manual_seed(0)
 
 class AdapAD:
-    def __init__(self, predictor_config, system_threshold):
+    def __init__(self, predictor_config, parameter_config, system_threshold):
         self.predictor_config = predictor_config
         self.system_threshold = system_threshold  
         self.num_features = len(feature_columns)
         
+        # Determine number of sensor nodes for SeaGuard data
+        if config_data_source == "SeaGuard":
+            # Count unique sensor nodes (Nord/Sor)
+            sensor_names = set()
+            for feature in feature_columns:
+                if "Nord" in feature:
+                    sensor_names.add("Nord")
+                elif "Sor" in feature:
+                    sensor_names.add("Sor")
+            self.num_nodes = len(sensor_names)
+            self.params_per_node = self.num_features // self.num_nodes if self.num_nodes > 0 else self.num_features
+        else:
+            # For other data sources like Austevoll with single node
+            self.num_nodes = 1
+            self.params_per_node = self.num_features
+        
+        # Initialize sensor range with the value_range_config
         self.sensor_range = NormalValueRangeDb()
+        for i, feature in enumerate(feature_columns):
+            if feature in value_range_config:
+                min_val, max_val = value_range_config[feature]
+                self.sensor_range.set(i, min_val, max_val)
         
         # Initialize parameter-specific thresholds from config
-        self.parameter_thresholds = {
-            param: config.parameter_config[param]['minimal_threshold']
-            for param in feature_columns
-        }
+        self.parameter_thresholds = {}
+        for param in feature_columns:
+            if 'minimal_threshold' in parameter_config[config_data_source][param]:
+                self.parameter_thresholds[param] = parameter_config[config_data_source][param]['minimal_threshold']
+            else:
+                # Default threshold if not specified
+                self.parameter_thresholds[param] = system_threshold
         
-        # Initialize main log file path
+        # Create log directory if it doesn't exist
+        if not os.path.exists(config.log_dir):
+            os.makedirs(config.log_dir)
+        
+        # Initialize main log file path and create it
         self.main_log_file = f"{config.log_dir}/system_log.csv"
+        with open(self.main_log_file, 'w') as f:
+            f.write("idx,is_anomalous,error,threshold\n")
+        
+        # Initialize feature-specific log files
+        self.feature_log_files = {}
+        for feature in feature_columns:
+            # Use shortened filenames to avoid path length issues
+            short_name = feature.replace("SeaGuard_", "").replace("_Sensor", "").replace(".", "_")
+            log_file_path = f"{config.log_dir}/{short_name}_log.csv"
+            self.feature_log_files[feature] = log_file_path
+            with open(log_file_path, 'w') as f:
+                f.write("idx,observed,predicted,lower_bound,upper_bound,is_anomalous,error,threshold\n")
         
         # Initialize predictor
-        self.data_predictor = MultivariateTimeSeriesPredictor(
-            num_features=self.num_features,
+        self.data_predictor = ParameterAwareTimeSeriesPredictor(
+            num_nodes=self.num_nodes,
+            params_per_node=self.params_per_node,
             hidden_size=config.LSTM_size,
             num_layers=config.LSTM_size_layer,
-            lookback_len=self.predictor_config['lookback_len']
+            lookback_len=self.predictor_config['lookback_len'],
+            d_model=config.transformer_dim,
+            nhead=config.transformer_heads,
+            num_encoder_layers=config.transformer_layers,
+            dim_feedforward=config.transformer_ff_dim,
+            dropout=config.transformer_dropout
         )
         
         # Initialize threshold generator
@@ -49,22 +95,6 @@ class AdapAD:
         self.thresholds = AnomalousThresholdDb()
         self.thresholds.append(self.system_threshold)
         self.anomalies = []
-
-        # Create log directory if it doesn't exist
-        if not os.path.exists(config.log_dir):
-            os.makedirs(config.log_dir)
-
-        # Initialize main system log file
-        if not os.path.exists(self.main_log_file):
-            with open(self.main_log_file, 'w') as f:
-                f.write("idx,is_anomalous,error,threshold\n")
-
-        # Initialize feature-specific log files
-        for feature in feature_columns:
-            log_file_path = f"{config.log_dir}/{feature}_log.csv"
-            if not os.path.exists(log_file_path):
-                with open(log_file_path, 'w') as f:
-                    f.write("idx,observed,predicted,lower_bound,upper_bound,is_anomalous,error,threshold\n")
 
     def __normalize_data(self, data):
         normalized_data = np.zeros_like(data)
@@ -166,8 +196,8 @@ class AdapAD:
         
         # Calculate errors and check individual parameter thresholds
         errors = predicted_val - normalized_val
-        self.current_errors = np.abs(errors)
-        mean_squared_error = np.mean(errors ** 2)  
+        self.current_errors = errors ** 2
+        mean_squared_error = np.mean(self.current_errors)
         
         # Check if any parameter exceeds its specific threshold
         is_anomalous_ret = False
@@ -223,22 +253,18 @@ class AdapAD:
             
             # Log for each feature
             for i, feature in enumerate(feature_columns):
-                log_file_path = f"{config.log_dir}/{feature}_log.csv"
+                log_file_path = self.feature_log_files[feature]
                 
-                # Append data
                 with open(log_file_path, 'a') as f:
-                    # First denormalize the observed and predicted values
                     observed_val = self.__reverse_normalized_data(normalized_val[i], i)
                     predicted_val_denorm = self.__reverse_normalized_data(predicted_val[i], i)
                     
-                    # Use parameter-specific threshold for individual features
                     parameter_threshold = self.parameter_thresholds[feature]
                     
                     # Calculate bounds using parameter-specific threshold
-                    lower_bound_norm = predicted_val[i] - parameter_threshold
-                    upper_bound_norm = predicted_val[i] + parameter_threshold
+                    lower_bound_norm = predicted_val[i] - np.sqrt(parameter_threshold)
+                    upper_bound_norm = predicted_val[i] + np.sqrt(parameter_threshold)
                     
-                    # Then denormalize the bounds
                     lower_bound = self.__reverse_normalized_data(lower_bound_norm, i)
                     upper_bound = self.__reverse_normalized_data(upper_bound_norm, i)
                     
@@ -246,11 +272,7 @@ class AdapAD:
                     text2write += f"{self.current_errors[i] > parameter_threshold},{self.current_errors[i]:.6f},{parameter_threshold:.6f}\n"
                     f.write(text2write)
             
-            # Log system metrics (using system-wide threshold for MSE)
-            if not os.path.exists(self.main_log_file):
-                with open(self.main_log_file, 'w') as f:
-                    f.write("idx,is_anomalous,error,threshold\n")
-                
+            # Log system metrics
             with open(self.main_log_file, 'a') as f:
                 f.write(f"{current_idx},{is_anomalous_ret},{mean_squared_error:.6f},{self.system_threshold:.6f}\n")
                 
@@ -271,41 +293,45 @@ class AdapAD:
         else:
             return False
 
+    def close_logs(self):
+        # Empty method to match function call in main
+        pass
+
 if __name__ == "__main__":
-
-    feature_columns = list(value_range_config.keys())
-
-    value_range_db = NormalValueRangeDb()
-
-    predictor_config, value_range_config, minimal_threshold = config.init_config()
+    # First load config and data source
+    predictor_config, parameter_config, minimal_threshold = config.init_config()
     if not minimal_threshold:
         raise Exception("It is mandatory to set a minimal threshold")
     
-    data_source = pd.read_csv(config.data_source_path)
-    data_source.columns = [col.strip() for col in data_source.columns]
+    df_data_source = pd.read_csv(config.data_source_path)
+    df_data_source.columns = [col.strip() for col in df_data_source.columns]
     
     # Create log directory if it doesn't exist
     if not os.path.exists(config.log_dir):
         os.makedirs(config.log_dir)
     
+    # Set feature columns BEFORE creating AdapAD instance
     feature_columns = config.feature_columns
-    missing_columns = [col for col in feature_columns if col not in data_source.columns]
+    missing_columns = [col for col in feature_columns if col not in df_data_source.columns]
     
     if missing_columns:
-        feature_columns = [col for col in feature_columns if col in data_source.columns]
+        feature_columns = [col for col in feature_columns if col in df_data_source.columns]
     
     if not feature_columns:
         raise Exception("No valid feature columns found in the dataset. Please check your configuration.")
     
+    # Initialize value range database
+    value_range_db = NormalValueRangeDb()
+    
     # Extract data from dataframe
     for col in feature_columns:
-        data_source[col] = pd.to_numeric(data_source[col], errors='coerce')
+        df_data_source[col] = pd.to_numeric(df_data_source[col], errors='coerce')
     
-    data_values = data_source[feature_columns].values
+    data_values = df_data_source[feature_columns].values
     len_data_subject = len(data_values)
     
-    # AdapAD
-    AdapAD_obj = AdapAD(predictor_config, minimal_threshold)
+    # Now create AdapAD instance after feature_columns is properly set
+    AdapAD_obj = AdapAD(predictor_config, parameter_config, minimal_threshold)
     
     observed_data = []
     

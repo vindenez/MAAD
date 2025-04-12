@@ -3,15 +3,20 @@ import config as config
         
 class NormalValueRangeDb():
     def __init__(self):
-        _, self.__value_range, _ = config.init_config()
+        self.__value_range = {}
         
     def lower(self, feature_idx=0):
-        feature_name = config.feature_columns[feature_idx]
-        return self.__value_range[feature_name][0]
+        if isinstance(feature_idx, int) and feature_idx in self.__value_range:
+            return self.__value_range[feature_idx][0]
+        return 0.0  # Default value if not found
         
     def upper(self, feature_idx=0):
-        feature_name = config.feature_columns[feature_idx]
-        return self.__value_range[feature_name][1]
+        if isinstance(feature_idx, int) and feature_idx in self.__value_range:
+            return self.__value_range[feature_idx][1]
+        return 1.0  # Default value if not found
+        
+    def set(self, feature_idx, min_val, max_val):
+        self.__value_range[feature_idx] = (min_val, max_val)
         
 class PredictedNormalDataDb():
     def __init__(self):

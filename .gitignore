@@ -1,3 +1,6 @@
 data/Tide*
 applsci-11-09373-v2.pdf
 .history
+results/
+*.pdf
+*.png
