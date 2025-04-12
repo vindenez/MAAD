@@ -360,18 +360,61 @@ class ParameterAwareTimeSeriesPredictor:
         return predictions
     
     def update(self, epoch_update, lr_update, past_observations, recent_observations):
+        """
+        Improved update method that better utilizes temporal information in the lookback window
+        for incremental learning with new observations.
+        """
         criterion = torch.nn.MSELoss()
         optimizer = torch.optim.Adam(self.predictor.parameters(), lr=lr_update)
         
         self.predictor.train()
         
-        for _ in range(epoch_update):
+        # Create mini-batch from past observations and new observation
+        # to ensure the model learns from the temporal sequence correctly
+        past_obs_np = past_observations.detach().cpu().numpy()
+        recent_observations_np = recent_observations.reshape(1, -1)
+        
+        # Shift window to create a new training example
+        if len(past_obs_np.shape) == 3:  # [batch, seq_len, features]
+            x_update = past_obs_np[0, 1:, :]  # Take all but first timestep
+            x_update = np.vstack([x_update, recent_observations_np])  # Add new observation at end
+            x_update = torch.tensor(x_update, dtype=torch.float32).unsqueeze(0)  # Back to tensor with batch dim
+        else:
+            # Fallback for other shapes
+            x_update = past_observations
+        
+        # Train for multiple epochs to reinforce learning
+        losses = []
+        for epoch in range(epoch_update):
             optimizer.zero_grad()
             
+            # Forward pass using current weights
             predicted_val = self.predictor(past_observations)
+            
+            # Target is the recent observation
             target = torch.from_numpy(np.array(recent_observations)).float().unsqueeze(0)
             
+            # Calculate loss
             loss = criterion(predicted_val, target)
+            
+            # Also add a prediction loss for the shifted window if possible
+            if 'x_update' in locals() and len(past_obs_np.shape) == 3:
+                try:
+                    next_pred = self.predictor(x_update)
+                    # The model should predict approximately the same output
+                    # This helps maintain temporal consistency
+                    consistency_loss = 0.2 * criterion(next_pred, predicted_val)
+                    loss += consistency_loss
+                except:
+                    pass  # Skip if shapes don't match
+            
+            # Backward pass and optimize
             loss.backward()
             optimizer.step()
+            
+            losses.append(loss.item())
+            
+            # Early stopping if loss increases to prevent overfitting
+            if len(losses) > 1 and losses[-1] > losses[-2]:
+                break
 

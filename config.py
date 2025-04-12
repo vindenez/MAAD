@@ -80,15 +80,15 @@ transformer_dropout = 0.1   # Explicit dropout rate
 
 # Training parameters
 epoch_train = 1000          # Increased from 1000 to 2000 for better convergence
-lr_train = 0.0002           # Increased slightly from 0.00005 to 0.0001 for faster initial learning
+lr_train = 0.0005           # Increased slightly from 0.00005 to 0.0001 for faster initial learning
 
 # Update MultivariateNormalDataPredictor parameters
 epoch_update = 100          # Reduced from 500 to 10 for frequent but lighter online updates
-lr_update = 0.0001         # Reduced from 0.0005 to 0.00005 to prevent overfitting to recent observations
+lr_update = 0.0005          # Increased from 0.0001 to 0.001 for better adaptation to new patterns
 
 # Update AnomalousThresholdGenerator parameters 
 update_G_epoch = 100         # Reduced from 500 to 20
-update_G_lr = 0.0001        # Reduced from 0.0005 to 0.0001
+update_G_lr = 0.0005        # Increased from 0.0001 to 0.001 for better threshold adaptation
 
 log_dir = f"results/{data_source}"
 
@@ -99,7 +99,7 @@ def init_config():
 
     # Predictor configuration
     predictor_config = dict()
-    predictor_config['lookback_len'] = 3                 # Increased from 3 to 5 for more context
+    predictor_config['lookback_len'] = 5                
     predictor_config['prediction_len'] = 1
     predictor_config['train_size'] = 5*predictor_config['lookback_len'] + \
                                      predictor_config['prediction_len'] 
