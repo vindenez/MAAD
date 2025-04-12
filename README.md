@@ -1,7 +1,9 @@
-An implementation of Adaptive Anomaly Detector (AdapAD) for multivariate input using a Transformer-LSTM neural network architecture. 
+An implementation of Multivariate Adaptive Anomaly Detector (MAAD) using a Transformer-LSTM neural network architecture. 
 
 The model aims to detect anomalous measurements from real-time multivariate time series data.
 Utilizes multivariate prediction based on past measurements from different sensor nodes with each sensor node having multiple sensor parameters. 
+
+This is an extension of AdapAD, a univariate and concept-drift-adaptive anomaly detector.
 
 ## References
 > Nguyen, N.T., Heldal, R. and Pelliccione, P., 2024. Concept-drift-adaptive anomaly detector for marine sensor data streams. Internet of Things, p.101414.
