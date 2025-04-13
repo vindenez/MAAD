@@ -322,7 +322,6 @@ class ParameterAwareTimeSeriesPredictor:
         x, y = self.prepare_data(data)
         x, y = x.astype(float), y.astype(float)
         
-        # Convert to PyTorch tensors
         train_tensorX = torch.Tensor(np.array(x))
         train_tensorY = torch.Tensor(np.array(y))
         
@@ -332,12 +331,10 @@ class ParameterAwareTimeSeriesPredictor:
         self.predictor.train()
         for epoch in range(epoch):
             total_loss = 0
-            # Iterate through each sliding window
             for i in range(len(x)):
                 optimizer.zero_grad()
                 
                 _x, _y = x[i], y[i]
-                # Add batch dimension and make prediction
                 outputs = self.predictor(torch.Tensor(_x).unsqueeze(0))
                 loss = criterion(outputs, torch.Tensor(_y).unsqueeze(0))
                 
@@ -360,30 +357,22 @@ class ParameterAwareTimeSeriesPredictor:
         return predictions
     
     def update(self, epoch_update, lr_update, past_observations, recent_observations):
-        """
-        Improved update method that better utilizes temporal information in the lookback window
-        for incremental learning with new observations.
-        """
         criterion = torch.nn.MSELoss()
         optimizer = torch.optim.Adam(self.predictor.parameters(), lr=lr_update)
         
         self.predictor.train()
         
-        # Create mini-batch from past observations and new observation
-        # to ensure the model learns from the temporal sequence correctly
         past_obs_np = past_observations.detach().cpu().numpy()
         recent_observations_np = recent_observations.reshape(1, -1)
         
         # Shift window to create a new training example
         if len(past_obs_np.shape) == 3:  # [batch, seq_len, features]
-            x_update = past_obs_np[0, 1:, :]  # Take all but first timestep
-            x_update = np.vstack([x_update, recent_observations_np])  # Add new observation at end
-            x_update = torch.tensor(x_update, dtype=torch.float32).unsqueeze(0)  # Back to tensor with batch dim
+            x_update = past_obs_np[0, 1:, :]  
+            x_update = np.vstack([x_update, recent_observations_np])  
+            x_update = torch.tensor(x_update, dtype=torch.float32).unsqueeze(0)  
         else:
-            # Fallback for other shapes
             x_update = past_observations
         
-        # Train for multiple epochs to reinforce learning
         losses = []
         for epoch in range(epoch_update):
             optimizer.zero_grad()
@@ -397,24 +386,280 @@ class ParameterAwareTimeSeriesPredictor:
             # Calculate loss
             loss = criterion(predicted_val, target)
             
-            # Also add a prediction loss for the shifted window if possible
             if 'x_update' in locals() and len(past_obs_np.shape) == 3:
                 try:
                     next_pred = self.predictor(x_update)
-                    # The model should predict approximately the same output
-                    # This helps maintain temporal consistency
                     consistency_loss = 0.2 * criterion(next_pred, predicted_val)
                     loss += consistency_loss
                 except:
-                    pass  # Skip if shapes don't match
+                    pass 
             
-            # Backward pass and optimize
             loss.backward()
             optimizer.step()
             
             losses.append(loss.item())
             
-            # Early stopping if loss increases to prevent overfitting
+            # Early stopping
             if len(losses) > 1 and losses[-1] > losses[-2]:
+                break
+
+class ParameterAwareTransformerPredictor(nn.Module):
+    def __init__(self, num_nodes, params_per_node, lookback_len, 
+                 d_model=96, nhead=4, num_encoder_layers=2, num_decoder_layers=2,
+                 dim_feedforward=384, dropout=0.1):
+        super(ParameterAwareTransformerPredictor, self).__init__()
+        
+        self.num_nodes = num_nodes  
+        self.params_per_node = params_per_node  
+        self.num_features = num_nodes * params_per_node  
+        self.lookback_len = lookback_len
+        self.d_model = d_model
+        
+        # Parameter type embeddings (to distinguish temperature, pressure, etc.)
+        self.parameter_embeddings = nn.Parameter(torch.randn(params_per_node, d_model // 2))
+        
+        # Node embeddings (to identify which sensor node the data comes from)
+        self.node_embeddings = nn.Parameter(torch.randn(num_nodes, d_model // 2))
+        
+        # Input projection to transformer dimension
+        self.input_projection = nn.Linear(1, d_model)
+        
+        # Positional encoding for time dimension
+        self.pos_encoder = PositionalEncoding(d_model, dropout)
+        
+        # Transformer encoder for processing input sequence
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
+        
+        # Transformer decoder for predictions
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model, 
+            nhead=nhead,
+            dim_feedforward=dim_feedforward, 
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
+        
+        # Query embedding used to generate predictions (learnable parameter)
+        self.query_embed = nn.Parameter(torch.randn(1, 1, d_model))
+        
+        # Output projection to feature space
+        self.output_projection = nn.Linear(d_model, self.num_features)
+        
+    def forward(self, x):
+        # x shape: [batch_size, lookback_len, num_features]
+        batch_size = x.size(0)
+        
+        # Reshape to separate node and parameter dimensions
+        # [batch, time, node, param]
+        x_reshaped = x.view(batch_size, self.lookback_len, self.num_nodes, self.params_per_node)
+        
+        # Process each time step
+        time_features = []
+        
+        for t in range(self.lookback_len):
+            # Get data for current time step: [batch, node, param]
+            x_t = x_reshaped[:, t, :, :]
+            
+            # Reshape to [batch * node * param, 1]
+            x_flat = x_t.reshape(batch_size * self.num_nodes * self.params_per_node, 1)
+            
+            # Project to embedding space: [batch * node * param, d_model]
+            x_proj = self.input_projection(x_flat)
+            
+            # Create indices for parameter and node types
+            node_indices = torch.arange(self.num_nodes).repeat_interleave(self.params_per_node)
+            node_indices = node_indices.repeat(batch_size).to(x.device)
+            
+            param_indices = torch.arange(self.params_per_node).repeat(self.num_nodes)
+            param_indices = param_indices.repeat(batch_size).to(x.device)
+            
+            # Add parameter and node embeddings
+            node_emb = self.node_embeddings[node_indices]  # [batch * node * param, d_model//2]
+            param_emb = self.parameter_embeddings[param_indices]  # [batch * node * param, d_model//2]
+            
+            # Combine embeddings with projected values
+            x_proj[:, :self.d_model//2] = node_emb
+            x_proj[:, self.d_model//2:] = param_emb
+            
+            # Reshape back: [batch, node*param, d_model]
+            x_time = x_proj.view(batch_size, self.num_nodes * self.params_per_node, self.d_model)
+            
+            # Average across features to get time representation
+            x_time_avg = x_time.mean(dim=1, keepdim=True)  # [batch, 1, d_model]
+            time_features.append(x_time_avg)
+        
+        # Stack along time dimension: [batch, lookback_len, d_model]
+        time_sequence = torch.cat(time_features, dim=1)
+        
+        # Apply positional encoding
+        time_sequence = self.pos_encoder(time_sequence)
+        
+        # Process with transformer encoder
+        memory = self.transformer_encoder(time_sequence)
+        
+        # Repeat query embedding for each batch item
+        query = self.query_embed.repeat(batch_size, 1, 1)
+        
+        # Use transformer decoder to generate prediction
+        out_seq = self.transformer_decoder(query, memory)
+        
+        out = self.output_projection(out_seq.squeeze(1))
+        
+        return out
+
+class TransformerTimeSeriesPredictor:
+    def __init__(self, num_nodes, params_per_node, lookback_len=5,
+                 d_model=96, nhead=4, num_encoder_layers=2, num_decoder_layers=2, 
+                 dim_feedforward=384, dropout=0.1):
+        
+        self.num_nodes = num_nodes
+        self.params_per_node = params_per_node
+        self.num_features = num_nodes * params_per_node
+        self.lookback_len = lookback_len
+        
+        self.predictor = ParameterAwareTransformerPredictor(
+            num_nodes=num_nodes,
+            params_per_node=params_per_node,
+            lookback_len=lookback_len,
+            d_model=d_model,
+            nhead=nhead,
+            num_encoder_layers=num_encoder_layers,
+            num_decoder_layers=num_decoder_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout
+        )
+    
+    def prepare_data(self, data):
+        x, y = [], []
+        
+        for i in range(len(data) - self.lookback_len):
+            x_i = data[i:i + self.lookback_len]
+            y_i = data[i + self.lookback_len]
+            
+            x.append(x_i)
+            y.append(y_i)
+            
+        return np.array(x), np.array(y)
+        
+    def train(self, epoch, lr, data):
+        x, y = self.prepare_data(data)
+        x, y = x.astype(float), y.astype(float)
+        
+        # Convert to PyTorch tensors
+        train_tensorX = torch.Tensor(np.array(x))
+        train_tensorY = torch.Tensor(np.array(y))
+        
+        criterion = torch.nn.MSELoss()
+        optimizer = torch.optim.Adam(self.predictor.parameters(), lr=lr)
+        
+        # Early stopping parameters
+        patience = 20  
+        best_loss = float('inf')
+        patience_counter = 0
+        min_delta = 0.0001  
+        
+        self.predictor.train()
+        epoch_losses = []
+        
+        for epoch_idx in range(epoch):
+            total_loss = 0
+            # Iterate through each sliding window
+            for i in range(len(x)):
+                optimizer.zero_grad()
+                
+                _x, _y = x[i], y[i]
+                # Add batch dimension and make prediction
+                outputs = self.predictor(torch.Tensor(_x).unsqueeze(0))
+                loss = criterion(outputs, torch.Tensor(_y).unsqueeze(0))
+                
+                loss.backward()
+                optimizer.step()
+                
+                total_loss += loss.item()
+            
+            # Calculate average loss for this epoch
+            avg_loss = total_loss / len(x)
+            epoch_losses.append(avg_loss)
+            
+            # Print progress every 100 epochs
+            if (epoch_idx + 1) % 100 == 0:
+                print(f'Epoch [{epoch_idx+1}/{epoch}], Loss: {avg_loss:.4f}')
+            
+            # Early stopping check
+            if avg_loss < best_loss - min_delta:
+                best_loss = avg_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                
+            if patience_counter >= patience and epoch_idx > 500:  
+                print(f'Early stopping at epoch {epoch_idx+1}. Best loss: {best_loss:.4f}')
+                break
+        
+        return train_tensorX, train_tensorY
+    
+    def predict(self, observed):
+        self.predictor.eval()
+        with torch.no_grad():
+            predictions = self.predictor(observed)
+            if isinstance(predictions, torch.Tensor):
+                predictions = predictions.numpy()
+        return predictions
+    
+    def update(self, epoch_update, lr_update, past_observations, recent_observations):
+        criterion = torch.nn.MSELoss()
+        optimizer = torch.optim.Adam(self.predictor.parameters(), lr=lr_update)
+        
+        self.predictor.train()
+        
+        # Create shifted window for training
+        past_obs_np = past_observations.detach().cpu().numpy()
+        recent_observations_np = recent_observations.reshape(1, -1)
+        
+        # Create shifted window where we remove the oldest observation and add the newest
+        if len(past_obs_np.shape) == 3:  # [batch, seq_len, features]
+            x_update = past_obs_np[0, 1:, :]  
+            x_update = np.vstack([x_update, recent_observations_np])
+            x_update = torch.tensor(x_update, dtype=torch.float32).unsqueeze(0)
+        else:
+            # Fallback if shape is unexpected
+            x_update = past_observations
+        
+        losses = []
+        for epoch in range(epoch_update):
+            optimizer.zero_grad()
+            predicted_val = self.predictor(past_observations)
+            target = torch.from_numpy(np.array(recent_observations)).float().unsqueeze(0)
+            
+            loss = criterion(predicted_val, target)
+            
+            # Add regularization to maintain temporal consistency
+            if 'x_update' in locals() and len(past_obs_np.shape) == 3:
+                try:
+                    consistency_weight = 0.3  # Strength of temporal consistency regularization
+                    with torch.no_grad():
+                        pseudo_target = self.predictor(past_observations).detach()
+                    
+                    next_pred = self.predictor(x_update)
+                    consistency_loss = consistency_weight * criterion(next_pred, pseudo_target)
+                    loss += consistency_loss
+                except:
+                    pass
+            
+            loss.backward()
+            optimizer.step()
+            
+            losses.append(loss.item())
+            
+            # Early stopping if loss increases
+            if len(losses) > 1 and losses[-1] > losses[-2] * 1.05:  
                 break
 

@@ -70,15 +70,14 @@ class AdapAD:
                 f.write("idx,observed,predicted,lower_bound,upper_bound,is_anomalous,error,threshold\n")
         
         # Initialize predictor
-        self.data_predictor = ParameterAwareTimeSeriesPredictor(
+        self.data_predictor = TransformerTimeSeriesPredictor(
             num_nodes=self.num_nodes,
             params_per_node=self.params_per_node,
-            hidden_size=config.LSTM_size,
-            num_layers=config.LSTM_size_layer,
             lookback_len=self.predictor_config['lookback_len'],
             d_model=config.transformer_dim,
             nhead=config.transformer_heads,
             num_encoder_layers=config.transformer_layers,
+            num_decoder_layers=config.transformer_layers,
             dim_feedforward=config.transformer_ff_dim,
             dropout=config.transformer_dropout
         )
@@ -95,6 +94,65 @@ class AdapAD:
         self.thresholds = AnomalousThresholdDb()
         self.thresholds.append(self.system_threshold)
         self.anomalies = []
+
+    def _log_config(self):
+        config_log_path = f"{config.log_dir}/config_log.txt"
+        
+        with open(config_log_path, 'w') as f:
+            # Log basic info and timestamp
+            import datetime
+            f.write(f"AdapAD Configuration Log - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("="*80 + "\n\n")
+            
+            # Log data source and feature info
+            f.write(f"Data Source: {config_data_source}\n")
+            f.write(f"Data Path: {config.data_source_path}\n")
+            f.write(f"Number of Features: {self.num_features}\n")
+            f.write(f"Number of Sensor Nodes: {self.num_nodes}\n")
+            f.write(f"Parameters per Node: {self.params_per_node}\n\n")
+            
+            # Log features and their thresholds
+            f.write("Features and Thresholds:\n")
+            for i, feature in enumerate(feature_columns):
+                min_val = self.sensor_range.lower(i)
+                max_val = self.sensor_range.upper(i)
+                threshold = self.parameter_thresholds[feature]
+                f.write(f"  {feature}:\n")
+                f.write(f"    - Range: [{min_val}, {max_val}]\n")
+                f.write(f"    - Threshold: {threshold}\n")
+            f.write("\n")
+            
+            # Log system threshold
+            f.write(f"System Threshold: {self.system_threshold}\n\n")
+            
+            # Log transformer hyperparameters
+            f.write("Transformer Configuration:\n")
+            f.write(f"  - d_model: {config.transformer_dim}\n")
+            f.write(f"  - attention heads: {config.transformer_heads}\n")
+            f.write(f"  - encoder layers: {config.transformer_layers}\n")
+            f.write(f"  - decoder layers: {config.transformer_layers}\n")
+            f.write(f"  - feedforward dim: {config.transformer_ff_dim}\n")
+            f.write(f"  - dropout: {config.transformer_dropout}\n\n")
+            
+            # Log LSTM configuration
+            f.write("LSTM Configuration (Threshold Generator):\n")
+            f.write(f"  - LSTM size: {config.LSTM_size}\n")
+            f.write(f"  - LSTM layers: {config.LSTM_size_layer}\n\n")
+            
+            # Log training parameters
+            f.write("Training Parameters:\n")
+            f.write(f"  - lookback length: {self.predictor_config['lookback_len']}\n")
+            f.write(f"  - prediction length: {self.predictor_config['prediction_len']}\n")
+            f.write(f"  - train size: {self.predictor_config['train_size']}\n")
+            f.write(f"  - training epochs: {config.epoch_train}\n")
+            f.write(f"  - training learning rate: {config.lr_train}\n\n")
+            
+            # Log update parameters
+            f.write("Update Parameters:\n")
+            f.write(f"  - update epochs: {config.epoch_update}\n")
+            f.write(f"  - update learning rate: {config.lr_update}\n")
+            f.write(f"  - generator update epochs: {config.update_G_epoch}\n")
+            f.write(f"  - generator update learning rate: {config.update_G_lr}\n")
 
     def __normalize_data(self, data):
         normalized_data = np.zeros_like(data)
@@ -155,20 +213,33 @@ class AdapAD:
         # Convert input to numpy array and handle missing values
         observed_val = np.array([float(x) if x != '' else np.nan for x in observed_val])
         
+        # Flag to track if values are out of range, but continue processing
+        is_out_of_range = False
+        
+        # Check for NaN values
         if np.any(np.isnan(observed_val)):
             self.anomalies.append(self.observed_vals.get_length())
-            self.observed_vals.append(np.zeros_like(observed_val))  
+            # Important: Still store the actual values (replacing NaNs with zeros) 
+            # but don't update the model with them
+            normalized_val = self.__normalize_data(np.nan_to_num(observed_val, 0))
+            self.observed_vals.append(normalized_val)
             return True
         
         # Check if any value is outside its sensor range
         for i, val in enumerate(observed_val):
-            if not self.is_inside_range(self.__normalize_data(observed_val)[i], i):
-                self.anomalies.append(self.observed_vals.get_length())
-                self.observed_vals.append(np.zeros_like(observed_val))
-                return True
+            norm_val = self.__normalize_data(observed_val)[i]
+            if not self.is_inside_range(norm_val, i):
+                is_out_of_range = True
+                break
         
-        # Normalize using config ranges
+        # Normalize using config ranges regardless of range check
         normalized_val = self.__normalize_data(observed_val)
+        
+        # If out of range, mark as anomaly but continue to store actual values
+        if is_out_of_range:
+            self.anomalies.append(self.observed_vals.get_length())
+            self.observed_vals.append(normalized_val)
+            return True
         
         # Get lookback window of past observations
         past_observations = self.observed_vals.get_tail(self.predictor_config['lookback_len'])
@@ -198,17 +269,7 @@ class AdapAD:
         errors = predicted_val - normalized_val
         self.current_errors = errors ** 2
         mean_squared_error = np.mean(self.current_errors)
-        
-        # Check if any parameter exceeds its specific threshold
-        is_anomalous_ret = False
-        for i, feature in enumerate(feature_columns):
-            if self.current_errors[i] > self.parameter_thresholds[feature]:
-                is_anomalous_ret = True
-                break
-        
-        # If no individual parameter is anomalous, check system-wide MSE
-        if not is_anomalous_ret:
-            is_anomalous_ret = mean_squared_error > self.system_threshold
+        root_mean_squared_error = np.sqrt(mean_squared_error)
         
         # Get threshold for logging 
         if self.predictive_errors and self.predictive_errors.get_length() >= self.predictor_config['lookback_len']:
@@ -220,34 +281,52 @@ class AdapAD:
         else:
             threshold = self.system_threshold
         
-        # Logging
-        self.__logging(is_anomalous_ret, normalized_val, predicted_val, threshold, mean_squared_error)
+        # Check if any parameter exceeds its specific threshold
+        is_parameter_anomalous = False
+        for i, feature in enumerate(feature_columns):
+            if self.current_errors[i] > self.parameter_thresholds[feature]:
+                is_parameter_anomalous = True
+                break
+        
+        # For the overall system anomaly status, use RMSE comparison to threshold
+        is_system_anomalous = root_mean_squared_error > threshold
+        
+        # Final anomaly status is determined by either parameter-specific or system-wide thresholds
+        is_anomalous_ret = is_parameter_anomalous or is_system_anomalous
+        
+        # Logging - Pass both parameter and system anomaly flags for more detailed logging
+        self.__logging(is_anomalous_ret, is_system_anomalous, normalized_val, predicted_val, 
+                    threshold, mean_squared_error, root_mean_squared_error)
+        
         self.observed_vals.append(normalized_val)
         self.predicted_vals.append(predicted_val)
         self.predictive_errors.append(mean_squared_error)
         
-        # Update models
-        self.data_predictor.update(
-            config.epoch_update,
-            config.lr_update,
-            past_observations_tensor,
-            normalized_val
-        )
-        
-        if threshold > self.system_threshold:
-            self.generator.update(
-                config.update_G_epoch,
-                config.update_G_lr,
-                past_errors_tensor,
-                mean_squared_error
+        # Only update models if values are within range and not anomalous
+        if not is_out_of_range:
+            # Update models
+            self.data_predictor.update(
+                config.epoch_update,
+                config.lr_update,
+                past_observations_tensor,
+                normalized_val
             )
+            
+            if threshold > self.system_threshold:
+                self.generator.update(
+                    config.update_G_epoch,
+                    config.update_G_lr,
+                    past_errors_tensor,
+                    mean_squared_error
+                )
         
         if is_anomalous_ret:
             self.anomalies.append(self.observed_vals.get_length())
         
-        return is_anomalous_ret
+        return is_anomalous_ret or is_out_of_range
 
-    def __logging(self, is_anomalous_ret, normalized_val, predicted_val, threshold, mean_squared_error):
+    def __logging(self, is_anomalous_ret, is_system_anomalous, normalized_val, predicted_val, 
+                threshold, mean_squared_error, root_mean_squared_error):
         try:
             current_idx = self.observed_vals.get_length() - 1
             
@@ -268,13 +347,18 @@ class AdapAD:
                     lower_bound = self.__reverse_normalized_data(lower_bound_norm, i)
                     upper_bound = self.__reverse_normalized_data(upper_bound_norm, i)
                     
+                    # Log feature-specific anomaly status based on its individual threshold
+                    feature_is_anomalous = self.current_errors[i] > parameter_threshold
+                    
                     text2write = f"{current_idx},{observed_val},{predicted_val_denorm},{lower_bound},{upper_bound},"
-                    text2write += f"{self.current_errors[i] > parameter_threshold},{self.current_errors[i]:.6f},{parameter_threshold:.6f}\n"
+                    text2write += f"{feature_is_anomalous},{self.current_errors[i]:.6f},{parameter_threshold:.6f}\n"
                     f.write(text2write)
             
-            # Log system metrics
+            # Log system metrics - use RMSE for the system log instead of MSE
+            # Compare RMSE to threshold for the system anomaly status
             with open(self.main_log_file, 'a') as f:
-                f.write(f"{current_idx},{is_anomalous_ret},{mean_squared_error:.6f},{self.system_threshold:.6f}\n")
+                # Use the is_system_anomalous flag which is based on RMSE comparison
+                f.write(f"{current_idx},{is_system_anomalous},{root_mean_squared_error:.6f},{(threshold):.6f}\n")
                 
         except Exception as e:
             import traceback
@@ -332,6 +416,8 @@ if __name__ == "__main__":
     
     # Now create AdapAD instance after feature_columns is properly set
     AdapAD_obj = AdapAD(predictor_config, parameter_config, minimal_threshold)
+
+    AdapAD_obj._log_config()
     
     observed_data = []
     
