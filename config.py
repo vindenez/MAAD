@@ -72,9 +72,12 @@ LSTM_size = 100
 # Transformer configuration
 transformer_dim = 256       
 transformer_heads = 16      
-transformer_layers = 6      
+transformer_layers = 8      
 transformer_ff_dim = 768    
 transformer_dropout = 0.15  
+
+mr_num_segments = 12           
+mr_temporal_kernel_size = 5
 
 # Training parameters
 epoch_train = 1000          
@@ -82,11 +85,11 @@ lr_train = 0.0005
 
 # Update parameters
 epoch_update = 100         
-lr_update = 0.0005          
+lr_update = 0.001          
 
 # Update AnomalousThresholdGenerator parameters 
 update_G_epoch = 100        
-update_G_lr = 0.0005        
+update_G_lr = 0.001        
 
 log_dir = f"results/{data_source}"
 

@@ -173,287 +173,259 @@ class MultivariateLSTMPredictor(nn.Module):
         out = self.fc(context)
         
         return out
-
-class ParameterAwareTransformerLSTMPredictor(nn.Module):
-    def __init__(self, num_nodes, params_per_node, hidden_size, num_layers, lookback_len, 
-                 d_model=64, nhead=4, num_encoder_layers=2, dim_feedforward=256, dropout=0.1):
-        super(ParameterAwareTransformerLSTMPredictor, self).__init__()
+class LongShortTermAttention(nn.Module):
+    def __init__(self, d_model, n_heads, num_segments=8, dropout=0.1):
+        super(LongShortTermAttention, self).__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.num_segments = num_segments
         
-        self.num_nodes = num_nodes  # Number of sensor nodes
-        self.params_per_node = params_per_node  # Parameters per node
-        self.num_features = num_nodes * params_per_node  # Total features
-        self.hidden_size = hidden_size
-        self.lookback_len = lookback_len
+        # Long-term attention (vanilla attention)
+        self.long_term_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        
+        # Short-term attention (segment-wise attention)
+        self.short_term_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        
+        # Prototypical hidden series for adaptive segmentation
+        self.proto_segments = nn.Parameter(torch.randn(num_segments, d_model))
+        
+        # Fusion layer to combine long and short term representations
+        self.fusion = nn.Linear(d_model * 2, d_model)
+        
+    def adaptive_segment(self, x):
+        # x: [batch_size, seq_len, d_model]
+        batch_size, seq_len = x.size(0), x.size(1)
+        
+        # Compute DTW alignment matrices between sequence and prototypes
+        segments = []
+        segment_indices = torch.zeros(batch_size, seq_len, dtype=torch.long, device=x.device)
+        
+        # Simple implementation of soft-DTW segmentation
+        # In practice, you would implement a differentiable DTW as in the paper
+        for b in range(batch_size):
+            # Compute similarities between sequence tokens and prototypes
+            similarities = torch.matmul(x[b], self.proto_segments.transpose(0, 1))  # [seq_len, num_segments]
+            
+            # Assign each token to the most similar prototype
+            segment_idx = torch.argmax(similarities, dim=1)  # [seq_len]
+            segment_indices[b] = segment_idx
+            
+            # Group by segments
+            batch_segments = []
+            for i in range(self.num_segments):
+                # Get indices for this segment
+                mask = (segment_idx == i)
+                if mask.sum() > 0:
+                    # Extract tokens for this segment
+                    segment_tokens = x[b, mask]
+                    batch_segments.append((i, segment_tokens))
+                    
+            segments.append(batch_segments)
+            
+        return segments, segment_indices
+            
+    def forward(self, x):
+        # x: [batch_size, seq_len, d_model]
+        batch_size, seq_len = x.size(0), x.size(1)
+        
+        # Long-term attention (global)
+        long_term_out, _ = self.long_term_attn(x, x, x)
+        
+        # Adaptive segmentation for short-term attention
+        segments, segment_indices = self.adaptive_segment(x)  # Get both segments and indices
+        
+        # Process each segment with short-term attention
+        short_term_out = torch.zeros_like(x)
+        
+        for b in range(batch_size):
+            for seg_idx, segment_tokens in segments[b]:
+                # Apply self-attention within each segment
+                if len(segment_tokens) > 1:  # Need at least 2 tokens for attention
+                    seg_out, _ = self.short_term_attn(
+                        segment_tokens.unsqueeze(0),
+                        segment_tokens.unsqueeze(0),
+                        segment_tokens.unsqueeze(0)
+                    )
+                    
+                    mask = (segment_indices[b] == seg_idx)
+                    positions = torch.where(mask)[0]
+                    
+                    for i, pos in enumerate(positions):
+                        if i < len(seg_out[0]):  # Safety check
+                            short_term_out[b, pos] = seg_out[0, i]
+                else:
+                    # For segments with only one token, just copy the token
+                    positions = torch.where(segment_indices[b] == seg_idx)[0]
+                    if len(positions) > 0:
+                        pos = positions[0]
+                        short_term_out[b, pos] = segment_tokens[0]
+        
+        # Combine long-term and short-term representations
+        combined = torch.cat([long_term_out, short_term_out], dim=-1)
+        output = self.fusion(combined)
+        
+        return output
+    
+class VariableSpecificConvolution(nn.Module):
+    def __init__(self, num_nodes, params_per_node, d_model, kernel_size=3):
+        super(VariableSpecificConvolution, self).__init__()
+        self.num_nodes = num_nodes
+        self.params_per_node = params_per_node
         self.d_model = d_model
         
-        # Parameter type embeddings (to distinguish temperature, pressure, etc.)
-        self.parameter_embeddings = nn.Parameter(torch.randn(params_per_node, d_model // 2))
+        # Create separate convolutional layers for each variable
+        self.convs = nn.ModuleList([
+            nn.Conv1d(
+                in_channels=1,
+                out_channels=d_model,
+                kernel_size=kernel_size,
+                padding=kernel_size//2
+            ) for _ in range(num_nodes * params_per_node)
+        ])
         
-        # Node embeddings (to identify which sensor node the data comes from)
-        self.node_embeddings = nn.Parameter(torch.randn(num_nodes, d_model // 2))
-        
-        # Input projection to transformer dimension
-        self.input_projection = nn.Linear(1, d_model)
-        
-        # Positional encoding for temporal dimension
-        self.pos_encoder = PositionalEncoding(d_model, dropout)
-        
-        # Transformer encoder - separate self-attention for each time step
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            batch_first=True
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
-        
-        # Calculate the actual input size for LSTM
-        lstm_input_size = self.num_nodes * self.params_per_node * d_model
-        
-        # LSTM
-        self.lstm = nn.LSTM(
-            input_size=lstm_input_size, 
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True
+        # Variable attention mechanism
+        self.variable_attention = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.Tanh(),
+            nn.Linear(d_model, 1),
+            nn.Softmax(dim=1)
         )
         
-        # Output layer
-        self.output_projection = nn.Linear(hidden_size, self.num_features)
-        
+        # Output projection
+        self.projection = nn.Linear(d_model, d_model)
+    
     def forward(self, x):
-        # x shape: [batch_size, lookback_len, num_features]
-        batch_size = x.size(0)
+        # x: [batch_size, seq_len, num_features]
+        batch_size, seq_len, num_features = x.size()
         
-        # Reshape to separate node and parameter dimensions
-        # [batch, time, node, param]
-        x_reshaped = x.view(batch_size, self.lookback_len, self.num_nodes, self.params_per_node)
+        # Process each variable separately
+        var_outputs = []
         
-        # Process each time step through transformer to model parameter relationships
-        transformed_sequence = []
+        for i in range(num_features):
+            # Extract this variable's time series
+            var_series = x[:, :, i].unsqueeze(1)  # [batch_size, 1, seq_len]
+            
+            # Apply 1D convolution
+            conv_out = self.convs[i](var_series)  # [batch_size, d_model, seq_len]
+            conv_out = conv_out.transpose(1, 2)  # [batch_size, seq_len, d_model]
+            
+            var_outputs.append(conv_out)
         
-        for t in range(self.lookback_len):
-            # Get data for current time step: [batch, node, param]
-            x_t = x_reshaped[:, t, :, :]
-            
-            # Prepare input for transformer with feature embeddings
-            # Reshape to [batch * node * param, 1]
-            x_flat = x_t.reshape(batch_size * self.num_nodes * self.params_per_node, 1)
-            
-            # Project to embedding space: [batch * node * param, d_model]
-            x_proj = self.input_projection(x_flat)
-            
-            # Create indices for parameter and node types
-            node_indices = torch.arange(self.num_nodes).repeat_interleave(self.params_per_node)
-            node_indices = node_indices.repeat(batch_size).to(x.device)
-            
-            param_indices = torch.arange(self.params_per_node).repeat(self.num_nodes)
-            param_indices = param_indices.repeat(batch_size).to(x.device)
-            
-            # Add parameter and node embeddings
-            node_emb = self.node_embeddings[node_indices]  # [batch * node * param, d_model//2]
-            param_emb = self.parameter_embeddings[param_indices]  # [batch * node * param, d_model//2]
-            
-            # Concatenate embeddings with projected values
-            # Replace first half of x_proj with node_emb and second half with param_emb
-            x_proj[:, :self.d_model//2] = node_emb
-            x_proj[:, self.d_model//2:] = param_emb
-            
-            # Reshape for transformer: [batch, node*param, d_model]
-            x_transformer = x_proj.view(batch_size, self.num_nodes * self.params_per_node, self.d_model)
-            
-            # Apply transformer to capture parameter relationships
-            x_transformer = self.transformer_encoder(x_transformer)
-            
-            # Store the transformed representation
-            transformed_sequence.append(x_transformer)
+        # Stack variable outputs
+        stacked_outputs = torch.stack(var_outputs, dim=1)  # [batch_size, num_features, seq_len, d_model]
         
-        # Stack along time dimension: [batch, time, node*param, d_model]
-        x_transformed = torch.stack(transformed_sequence, dim=1)
+        # Apply variable attention
+        var_weights = self.variable_attention(stacked_outputs.mean(dim=2))  # [batch_size, num_features, 1]
+        weighted_outputs = stacked_outputs * var_weights.unsqueeze(2)  # [batch_size, num_features, seq_len, d_model]
         
-        # Reshape for LSTM: [batch, time, node*param*d_model]
-        x_for_lstm = x_transformed.reshape(batch_size, self.lookback_len, -1)
+        # Aggregate across variables
+        aggregated = weighted_outputs.sum(dim=1)  # [batch_size, seq_len, d_model]
         
-        # Process through LSTM for temporal dynamics
-        _, (h_n, _) = self.lstm(x_for_lstm)
-        h_n = h_n[-1]  # Take the last layer's hidden state
+        # Final projection
+        output = self.projection(aggregated)
         
-        # Generate predictions for all features
-        out = self.output_projection(h_n)  # [batch_size, num_features]
-        
-        return out
+        return output
 
-class ParameterAwareTimeSeriesPredictor:
-    def __init__(self, num_nodes, params_per_node, hidden_size=100, num_layers=3, lookback_len=3,
-                 d_model=64, nhead=4, num_encoder_layers=2, dim_feedforward=256, dropout=0.1):
+class MRTransformerPredictor(nn.Module):
+    def __init__(self, 
+                 num_nodes, 
+                 params_per_node, 
+                 lookback_len,
+                 d_model=256, 
+                 nhead=8, 
+                 num_encoder_layers=3, 
+                 num_decoder_layers=3,
+                 dim_feedforward=768, 
+                 dropout=0.1, 
+                 num_segments=8):
+        super(MRTransformerPredictor, self).__init__()
         
         self.num_nodes = num_nodes
         self.params_per_node = params_per_node
         self.num_features = num_nodes * params_per_node
         self.lookback_len = lookback_len
-        
-        self.predictor = ParameterAwareTransformerLSTMPredictor(
-            num_nodes=num_nodes,
-            params_per_node=params_per_node,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            lookback_len=lookback_len,
-            d_model=d_model,
-            nhead=nhead,
-            num_encoder_layers=num_encoder_layers,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout
-        )
-    
-    def prepare_data(self, data):
-        x, y = [], []
-        
-        for i in range(len(data) - self.lookback_len):
-            x_i = data[i:i + self.lookback_len]
-            y_i = data[i + self.lookback_len]
-            
-            x.append(x_i)
-            y.append(y_i)
-            
-        return np.array(x), np.array(y)
-        
-    def train(self, epoch, lr, data):
-        x, y = self.prepare_data(data)
-        x, y = x.astype(float), y.astype(float)
-        
-        train_tensorX = torch.Tensor(np.array(x))
-        train_tensorY = torch.Tensor(np.array(y))
-        
-        criterion = torch.nn.MSELoss()
-        optimizer = torch.optim.Adam(self.predictor.parameters(), lr=lr)
-        
-        self.predictor.train()
-        for epoch in range(epoch):
-            total_loss = 0
-            for i in range(len(x)):
-                optimizer.zero_grad()
-                
-                _x, _y = x[i], y[i]
-                outputs = self.predictor(torch.Tensor(_x).unsqueeze(0))
-                loss = criterion(outputs, torch.Tensor(_y).unsqueeze(0))
-                
-                loss.backward()
-                optimizer.step()
-                
-                total_loss += loss.item()
-            
-            if (epoch + 1) % 100 == 0:
-                print(f'Epoch [{epoch+1}/{epoch}], Loss: {total_loss/len(x):.4f}')
-        
-        return train_tensorX, train_tensorY
-    
-    def predict(self, observed):
-        self.predictor.eval()
-        with torch.no_grad():
-            predictions = self.predictor(observed)
-            if isinstance(predictions, torch.Tensor):
-                predictions = predictions.numpy()
-        return predictions
-    
-    def update(self, epoch_update, lr_update, past_observations, recent_observations):
-        criterion = torch.nn.MSELoss()
-        optimizer = torch.optim.Adam(self.predictor.parameters(), lr=lr_update)
-        
-        self.predictor.train()
-        
-        past_obs_np = past_observations.detach().cpu().numpy()
-        recent_observations_np = recent_observations.reshape(1, -1)
-        
-        # Shift window to create a new training example
-        if len(past_obs_np.shape) == 3:  # [batch, seq_len, features]
-            x_update = past_obs_np[0, 1:, :]  
-            x_update = np.vstack([x_update, recent_observations_np])  
-            x_update = torch.tensor(x_update, dtype=torch.float32).unsqueeze(0)  
-        else:
-            x_update = past_observations
-        
-        losses = []
-        for epoch in range(epoch_update):
-            optimizer.zero_grad()
-            
-            # Forward pass using current weights
-            predicted_val = self.predictor(past_observations)
-            
-            # Target is the recent observation
-            target = torch.from_numpy(np.array(recent_observations)).float().unsqueeze(0)
-            
-            # Calculate loss
-            loss = criterion(predicted_val, target)
-            
-            if 'x_update' in locals() and len(past_obs_np.shape) == 3:
-                try:
-                    next_pred = self.predictor(x_update)
-                    consistency_loss = 0.2 * criterion(next_pred, predicted_val)
-                    loss += consistency_loss
-                except:
-                    pass 
-            
-            loss.backward()
-            optimizer.step()
-            
-            losses.append(loss.item())
-            
-            # Early stopping
-            if len(losses) > 1 and losses[-1] > losses[-2]:
-                break
-
-class ParameterAwareTransformerPredictor(nn.Module):
-    def __init__(self, num_nodes, params_per_node, lookback_len, 
-                 d_model=96, nhead=4, num_encoder_layers=2, num_decoder_layers=2,
-                 dim_feedforward=384, dropout=0.1):
-        super(ParameterAwareTransformerPredictor, self).__init__()
-        
-        self.num_nodes = num_nodes  
-        self.params_per_node = params_per_node  
-        self.num_features = num_nodes * params_per_node  
-        self.lookback_len = lookback_len
         self.d_model = d_model
         
-        # Parameter type embeddings (to distinguish temperature, pressure, etc.)
+        # Parameter and node embeddings
         self.parameter_embeddings = nn.Parameter(torch.randn(params_per_node, d_model // 2))
-        
-        # Node embeddings (to identify which sensor node the data comes from)
         self.node_embeddings = nn.Parameter(torch.randn(num_nodes, d_model // 2))
         
-        # Input projection to transformer dimension
+        # Input projection
         self.input_projection = nn.Linear(1, d_model)
         
-        # Positional encoding for time dimension
+        # Positional encoding
         self.pos_encoder = PositionalEncoding(d_model, dropout)
         
-        # Transformer encoder for processing input sequence
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            batch_first=True
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
+        # Long short-term attention layers for encoder
+        self.encoder_lst_layers = nn.ModuleList([
+            LongShortTermAttention(d_model, nhead, num_segments, dropout)
+            for _ in range(num_encoder_layers)
+        ])
         
-        # Transformer decoder for predictions
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=d_model, 
-            nhead=nhead,
-            dim_feedforward=dim_feedforward, 
-            dropout=dropout,
-            batch_first=True
+        # Variable-specific temporal convolution
+        self.var_specific_conv = VariableSpecificConvolution(
+            num_nodes, 
+            params_per_node, 
+            d_model,
+            kernel_size=5
         )
-        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
         
-        # Query embedding used to generate predictions (learnable parameter)
+        # Long short-term attention layers for decoder
+        self.decoder_lst_layers = nn.ModuleList([
+            LongShortTermAttention(d_model, nhead, num_segments, dropout)
+            for _ in range(num_decoder_layers)
+        ])
+        
+        # Cross-attention for decoder
+        self.cross_attention = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        
+        # Feed-forward networks
+        self.encoder_ffn = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, dim_feedforward),
+                nn.ReLU(),
+                nn.Linear(dim_feedforward, d_model),
+                nn.Dropout(dropout)
+            ) for _ in range(num_encoder_layers)
+        ])
+        
+        self.decoder_ffn = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, dim_feedforward),
+                nn.ReLU(),
+                nn.Linear(dim_feedforward, d_model),
+                nn.Dropout(dropout)
+            ) for _ in range(num_decoder_layers)
+        ])
+        
+        # Layer normalization
+        self.encoder_norms1 = nn.ModuleList([
+            nn.LayerNorm(d_model) for _ in range(num_encoder_layers)
+        ])
+        self.encoder_norms2 = nn.ModuleList([
+            nn.LayerNorm(d_model) for _ in range(num_encoder_layers)
+        ])
+        
+        self.decoder_norms1 = nn.ModuleList([
+            nn.LayerNorm(d_model) for _ in range(num_decoder_layers)
+        ])
+        self.decoder_norms2 = nn.ModuleList([
+            nn.LayerNorm(d_model) for _ in range(num_decoder_layers)
+        ])
+        self.decoder_norms3 = nn.ModuleList([
+            nn.LayerNorm(d_model) for _ in range(num_decoder_layers)
+        ])
+        
+        # Query embedding for decoder
         self.query_embed = nn.Parameter(torch.randn(1, 1, d_model))
         
-        # Output projection to feature space
+        # Output projection
         self.output_projection = nn.Linear(d_model, self.num_features)
         
-    def forward(self, x):
+        # Integration layer for combining variable-consistent and variable-specific features
+        self.integration = nn.Linear(d_model * 2, d_model)
+        
+    def _prepare_inputs(self, x):
         # x shape: [batch_size, lookback_len, num_features]
         batch_size = x.size(0)
         
@@ -486,11 +458,12 @@ class ParameterAwareTransformerPredictor(nn.Module):
             param_emb = self.parameter_embeddings[param_indices]  # [batch * node * param, d_model//2]
             
             # Combine embeddings with projected values
-            x_proj[:, :self.d_model//2] = node_emb
-            x_proj[:, self.d_model//2:] = param_emb
+            x_proj_combined = torch.zeros_like(x_proj)
+            x_proj_combined[:, :self.d_model//2] = node_emb
+            x_proj_combined[:, self.d_model//2:] = param_emb
             
             # Reshape back: [batch, node*param, d_model]
-            x_time = x_proj.view(batch_size, self.num_nodes * self.params_per_node, self.d_model)
+            x_time = x_proj_combined.view(batch_size, self.num_nodes * self.params_per_node, self.d_model)
             
             # Average across features to get time representation
             x_time_avg = x_time.mean(dim=1, keepdim=True)  # [batch, 1, d_model]
@@ -502,30 +475,75 @@ class ParameterAwareTransformerPredictor(nn.Module):
         # Apply positional encoding
         time_sequence = self.pos_encoder(time_sequence)
         
-        # Process with transformer encoder
-        memory = self.transformer_encoder(time_sequence)
+        return time_sequence, x
         
-        # Repeat query embedding for each batch item
-        query = self.query_embed.repeat(batch_size, 1, 1)
+    def forward(self, x):
+        # x shape: [batch_size, lookback_len, num_features]
+        batch_size = x.size(0)
         
-        # Use transformer decoder to generate prediction
-        out_seq = self.transformer_decoder(query, memory)
+        # Prepare inputs for encoder
+        encoder_input, orig_input = self._prepare_inputs(x)
         
-        out = self.output_projection(out_seq.squeeze(1))
+        # Variable-specific processing with temporal convolution
+        var_specific_features = self.var_specific_conv(x)
         
-        return out
-
-class TransformerTimeSeriesPredictor:
+        # Encoder processing with long short-term attention
+        encoder_output = encoder_input
+        
+        for i in range(len(self.encoder_lst_layers)):
+            # Long short-term attention
+            attn_output = self.encoder_lst_layers[i](encoder_output)
+            encoder_output = self.encoder_norms1[i](encoder_output + attn_output)
+            
+            # Feed-forward
+            ff_output = self.encoder_ffn[i](encoder_output)
+            encoder_output = self.encoder_norms2[i](encoder_output + ff_output)
+        
+        # Prepare decoder input (query embedding)
+        decoder_input = self.query_embed.repeat(batch_size, 1, 1)
+        
+        # Decoder processing
+        decoder_output = decoder_input
+        
+        for i in range(len(self.decoder_lst_layers)):
+            # Self-attention
+            self_attn_output = self.decoder_lst_layers[i](decoder_output)
+            decoder_output = self.decoder_norms1[i](decoder_output + self_attn_output)
+            
+            # Cross-attention with encoder output
+            cross_attn_output, _ = self.cross_attention(
+                decoder_output, encoder_output, encoder_output
+            )
+            decoder_output = self.decoder_norms2[i](decoder_output + cross_attn_output)
+            
+            # Feed-forward
+            ff_output = self.decoder_ffn[i](decoder_output)
+            decoder_output = self.decoder_norms3[i](decoder_output + ff_output)
+        
+        # Combine variable-consistent and variable-specific features
+        # Adjust dimensions if needed
+        if var_specific_features.size(1) != decoder_output.size(1):
+            var_specific_features = var_specific_features[:, -1:, :]
+            
+        combined_features = torch.cat([decoder_output, var_specific_features], dim=-1)
+        integrated_features = self.integration(combined_features)
+        
+        # Generate final predictions
+        output = self.output_projection(integrated_features.squeeze(1))
+        
+        return output
+    
+class MRTransformerTimeSeriesPredictor:
     def __init__(self, num_nodes, params_per_node, lookback_len=5,
-                 d_model=96, nhead=4, num_encoder_layers=2, num_decoder_layers=2, 
-                 dim_feedforward=384, dropout=0.1):
+                 d_model=256, nhead=8, num_encoder_layers=3, num_decoder_layers=3,
+                 dim_feedforward=768, dropout=0.1, num_segments=8):
         
         self.num_nodes = num_nodes
         self.params_per_node = params_per_node
         self.num_features = num_nodes * params_per_node
         self.lookback_len = lookback_len
         
-        self.predictor = ParameterAwareTransformerPredictor(
+        self.predictor = MRTransformerPredictor(
             num_nodes=num_nodes,
             params_per_node=params_per_node,
             lookback_len=lookback_len,
@@ -534,7 +552,8 @@ class TransformerTimeSeriesPredictor:
             num_encoder_layers=num_encoder_layers,
             num_decoder_layers=num_decoder_layers,
             dim_feedforward=dim_feedforward,
-            dropout=dropout
+            dropout=dropout,
+            num_segments=num_segments
         )
     
     def prepare_data(self, data):
@@ -553,7 +572,6 @@ class TransformerTimeSeriesPredictor:
         x, y = self.prepare_data(data)
         x, y = x.astype(float), y.astype(float)
         
-        # Convert to PyTorch tensors
         train_tensorX = torch.Tensor(np.array(x))
         train_tensorY = torch.Tensor(np.array(y))
         
@@ -561,22 +579,21 @@ class TransformerTimeSeriesPredictor:
         optimizer = torch.optim.Adam(self.predictor.parameters(), lr=lr)
         
         # Early stopping parameters
-        patience = 20  
+        patience = 20
         best_loss = float('inf')
         patience_counter = 0
-        min_delta = 0.0001  
+        min_delta = 0.0001
         
         self.predictor.train()
         epoch_losses = []
         
         for epoch_idx in range(epoch):
             total_loss = 0
-            # Iterate through each sliding window
+            
             for i in range(len(x)):
                 optimizer.zero_grad()
                 
                 _x, _y = x[i], y[i]
-                # Add batch dimension and make prediction
                 outputs = self.predictor(torch.Tensor(_x).unsqueeze(0))
                 loss = criterion(outputs, torch.Tensor(_y).unsqueeze(0))
                 
@@ -585,22 +602,20 @@ class TransformerTimeSeriesPredictor:
                 
                 total_loss += loss.item()
             
-            # Calculate average loss for this epoch
             avg_loss = total_loss / len(x)
             epoch_losses.append(avg_loss)
             
-            # Print progress every 100 epochs
             if (epoch_idx + 1) % 100 == 0:
                 print(f'Epoch [{epoch_idx+1}/{epoch}], Loss: {avg_loss:.4f}')
             
-            # Early stopping check
+            # Early stopping
             if avg_loss < best_loss - min_delta:
                 best_loss = avg_loss
                 patience_counter = 0
             else:
                 patience_counter += 1
                 
-            if patience_counter >= patience and epoch_idx > 500:  
+            if patience_counter >= patience and epoch_idx > 300:
                 print(f'Early stopping at epoch {epoch_idx+1}. Best loss: {best_loss:.4f}')
                 break
         
@@ -620,31 +635,30 @@ class TransformerTimeSeriesPredictor:
         
         self.predictor.train()
         
-        # Create shifted window for training
         past_obs_np = past_observations.detach().cpu().numpy()
         recent_observations_np = recent_observations.reshape(1, -1)
         
-        # Create shifted window where we remove the oldest observation and add the newest
-        if len(past_obs_np.shape) == 3:  # [batch, seq_len, features]
-            x_update = past_obs_np[0, 1:, :]  
+        # Shift window to create new training example
+        if len(past_obs_np.shape) == 3:
+            x_update = past_obs_np[0, 1:, :]
             x_update = np.vstack([x_update, recent_observations_np])
             x_update = torch.tensor(x_update, dtype=torch.float32).unsqueeze(0)
         else:
-            # Fallback if shape is unexpected
             x_update = past_observations
         
         losses = []
         for epoch in range(epoch_update):
             optimizer.zero_grad()
+            
             predicted_val = self.predictor(past_observations)
             target = torch.from_numpy(np.array(recent_observations)).float().unsqueeze(0)
             
             loss = criterion(predicted_val, target)
             
-            # Add regularization to maintain temporal consistency
+            # Add consistency regularization
             if 'x_update' in locals() and len(past_obs_np.shape) == 3:
                 try:
-                    consistency_weight = 0.3  # Strength of temporal consistency regularization
+                    consistency_weight = 0.3
                     with torch.no_grad():
                         pseudo_target = self.predictor(past_observations).detach()
                     
@@ -659,7 +673,6 @@ class TransformerTimeSeriesPredictor:
             
             losses.append(loss.item())
             
-            # Early stopping if loss increases
-            if len(losses) > 1 and losses[-1] > losses[-2] * 1.05:  
+            # Early stopping
+            if len(losses) > 1 and losses[-1] > losses[-2] * 1.05:
                 break
-

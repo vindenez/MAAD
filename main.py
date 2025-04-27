@@ -69,17 +69,17 @@ class AdapAD:
             with open(log_file_path, 'w') as f:
                 f.write("idx,observed,predicted,lower_bound,upper_bound,is_anomalous,error,threshold\n")
         
-        # Initialize predictor
-        self.data_predictor = TransformerTimeSeriesPredictor(
+        self.data_predictor = MRTransformerTimeSeriesPredictor(
             num_nodes=self.num_nodes,
             params_per_node=self.params_per_node,
             lookback_len=self.predictor_config['lookback_len'],
             d_model=config.transformer_dim,
             nhead=config.transformer_heads,
-            num_encoder_layers=config.transformer_layers,
-            num_decoder_layers=config.transformer_layers,
+            num_encoder_layers=config.transformer_layers // 2,  
+            num_decoder_layers=config.transformer_layers // 2,
             dim_feedforward=config.transformer_ff_dim,
-            dropout=config.transformer_dropout
+            dropout=config.transformer_dropout,
+            num_segments=config.mr_num_segments 
         )
         
         # Initialize threshold generator
